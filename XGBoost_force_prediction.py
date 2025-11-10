@@ -8,11 +8,11 @@ from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
 import matplotlib.pyplot as plt
 import pickle
 
-def plot_all_targets_summary(y_true, y_pred, target_names):
+def plot_all_targets_summary(y_true, y_pred, target_names, save_dir=None, version=None):
     n_targets = y_true.shape[1]
-    n_rows = (n_targets + 3) // 4
-    fig, axes = plt.subplots(n_rows, 4, figsize=(20, 5 * n_rows))
-    axes = axes.flatten()
+    fig, axes = plt.subplots(1, n_targets, figsize=(4*n_targets, 4))
+    if n_targets == 1:
+        axes = [axes]
     for i in range(n_targets):
         ax = axes[i]
         true_vals = y_true[:, i]; pred_vals = y_pred[:, i]
@@ -24,9 +24,17 @@ def plot_all_targets_summary(y_true, y_pred, target_names):
         ax.set_title(f'{target_names[i]}\nMAE: {mae:.2f} | R²: {r2:.3f}', fontsize=10)
         ax.set_xlabel('Actual', fontsize=8); ax.set_ylabel('Predicted', fontsize=8)
         ax.grid(True, alpha=0.3); ax.set_xlim(lims); ax.set_ylim(lims)
-    for i in range(n_targets, len(axes)):
-        axes[i].axis('off')
-    plt.tight_layout(); plt.show()
+    plt.tight_layout()
+    
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        plot_name = f'xgboost_predictions_summary_{version}.png' if version else 'xgboost_predictions_summary.png'
+        plot_path = os.path.join(save_dir, plot_name)
+        fig.savefig(plot_path, bbox_inches='tight', dpi=300)
+        print(f"Saved predictions plot to: {plot_path}")
+    
+    plt.show()
+    return fig
 
 def calculate_grouped_rmse(y_true, y_pred):
     contact_location_true, contact_location_pred = y_true[:, :2], y_pred[:, :2]
@@ -46,29 +54,9 @@ def calculate_grouped_rmse(y_true, y_pred):
 
 if __name__ == "__main__":
     # --- 1. Load and Preprocess Data ---
-    DATA_DIRECTORY = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\synchronized sensor and ATI"
+    DATA_DIRECTORY = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\test data" 
     CSV_FILENAMES = [
-        "synchronized_events_1.csv",
-        "synchronized_events_2.csv",
-        "synchronized_events_3.csv",
-        "synchronized_events_4.csv",
-        "synchronized_events_5.csv",
-        "synchronized_events_6.csv",
-        "synchronized_events_7.csv",
-        "synchronized_events_8.csv",
-        "synchronized_events_12.csv",
-        "synchronized_events_21.csv",
-        "synchronized_events_22.csv",
-        "synchronized_events_23.csv",
-        "synchronized_events_24.csv",
-        "synchronized_events_25.csv",
-        "synchronized_events_26.csv",
-        "synchronized_events_27.csv",
-        "synchronized_events_28.csv",
-        "synchronized_events_29.csv",
-        "synchronized_events_30.csv",
-        "synchronized_events_31.csv",
-        "synchronized_events_32.csv",        
+        "test 101 - sensor v1\synchronized_events_101.csv" 
     ]
     
     all_dfs = []
@@ -169,9 +157,13 @@ if __name__ == "__main__":
     
     calculate_grouped_rmse(y_test, predictions)
     
+    # Extract version number for plots
+    version = CSV_FILENAMES[0].split("sensor ")[1].split("\\")[0]
+    
     # Plot all targets summary
     print("\nGenerating prediction plots...")
-    plot_all_targets_summary(y_test, predictions, OUTPUT_TARGETS)
+    save_dir = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\Thesis - Tactile Sensor\models paramters\XGBoost"
+    plot_all_targets_summary(y_test, predictions, OUTPUT_TARGETS, save_dir=save_dir, version=version)
 
     print("\n" + "="*70 + "\nPER-TARGET PERFORMANCE METRICS\n" + "="*70)
     for i, target in enumerate(OUTPUT_TARGETS):
@@ -182,11 +174,19 @@ if __name__ == "__main__":
     # --- 5. Save the Models and Scaler ---
     print("\n" + "="*70 + "\nSAVING MODELS AND SCALER\n" + "="*70)
 
-    with open('specialized_xgb_models.pkl', 'wb') as f:
+    # Extract version number from the CSV filename
+    version = CSV_FILENAMES[0].split("sensor ")[1].split("\\")[0]  # This will extract "v2" from the filename
+    
+    save_dir = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\Thesis - Tactile Sensor\models paramters\XGBoost"
+    models_path = os.path.join(save_dir, f'specialized_xgb_models_{version}.pkl')
+    scaler_path = os.path.join(save_dir, f'x_scaler_xgb_{version}.pkl')
+    
+    with open(models_path, 'wb') as f:
         pickle.dump(models, f)
-    with open('x_scaler_xgb.pkl', 'wb') as f:
+    with open(scaler_path, 'wb') as f:
         pickle.dump(x_scaler, f)
 
-    print("Dictionary of specialized XGBoost models saved to: specialized_xgb_models.pkl")
+    print(f"Dictionary of specialized XGBoost models saved to: {models_path}")
+    print(f"X scaler saved to: {scaler_path}")
     print("X scaler saved to: x_scaler_xgb.pkl")
     print("\nProcess complete!")

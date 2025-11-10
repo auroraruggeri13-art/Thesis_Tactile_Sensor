@@ -143,11 +143,16 @@ if __name__ == "__main__":
     # --- 5. Save the Model and Scalers ---
     print("\n" + "="*70 + "\nSAVING MODEL AND SCALERS\n" + "="*70)
 
-    with open('multi_output_svr.pkl', 'wb') as f:
+    save_dir = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\Thesis - Tactile Sensor"
+    models_path = os.path.join(save_dir, 'multi_output_svr.pkl')
+    x_scaler_path = os.path.join(save_dir, 'x_scaler_svr.pkl')
+    y_scaler_path = os.path.join(save_dir, 'y_scaler_svr.pkl')
+    
+    with open(models_path, 'wb') as f:
         pickle.dump(multi_output_svr, f)
-    with open('x_scaler_svr.pkl', 'wb') as f:
+    with open(x_scaler_path, 'wb') as f:
         pickle.dump(x_scaler, f)
-    with open('y_scaler_svr.pkl', 'wb') as f:
+    with open(y_scaler_path, 'wb') as f:
         pickle.dump(y_scaler, f)
 
     print("Multi-output SVR model saved to: multi_output_svr.pkl")

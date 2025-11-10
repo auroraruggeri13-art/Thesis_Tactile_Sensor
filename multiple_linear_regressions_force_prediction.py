@@ -12,9 +12,9 @@ import pickle
 def plot_all_targets_summary(y_true, y_pred, target_names):
     """Plot a summary of all target predictions"""
     n_targets = y_true.shape[1]
-    n_rows = (n_targets + 3) // 4  # Calculate rows needed
-    fig, axes = plt.subplots(n_rows, 4, figsize=(20, 5 * n_rows))
-    axes = axes.flatten()
+    fig, axes = plt.subplots(1, n_targets, figsize=(4*n_targets, 4))
+    if n_targets == 1:
+        axes = [axes]
     
     for i in range(n_targets):
         ax = axes[i]
@@ -40,12 +40,8 @@ def plot_all_targets_summary(y_true, y_pred, target_names):
         ax.set_xlim(lims)
         ax.set_ylim(lims)
     
-    # Hide unused subplots
-    for i in range(n_targets, len(axes)):
-        axes[i].axis('off')
-    
     plt.tight_layout()
-    plt.show()
+    return fig
 
 def calculate_grouped_rmse(y_true, y_pred):
     """Calculate RMSE for contact location and force vector separately"""
@@ -89,29 +85,9 @@ def calculate_grouped_rmse(y_true, y_pred):
 
 if __name__ == "__main__":
     # --- 1. Load and Combine Data ---
-    DATA_DIRECTORY = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\synchronized sensor and ATI" 
+    DATA_DIRECTORY = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\test data" 
     CSV_FILENAMES = [
-        "synchronized_events_1.csv",
-        "synchronized_events_2.csv",
-        "synchronized_events_3.csv",
-        "synchronized_events_4.csv",
-        "synchronized_events_5.csv",
-        "synchronized_events_6.csv",
-        "synchronized_events_7.csv",
-        "synchronized_events_8.csv",
-        "synchronized_events_12.csv",
-        "synchronized_events_21.csv",
-        "synchronized_events_22.csv",
-        "synchronized_events_23.csv",
-        "synchronized_events_24.csv",
-        "synchronized_events_25.csv",
-        "synchronized_events_26.csv",
-        "synchronized_events_27.csv",
-        "synchronized_events_28.csv",
-        "synchronized_events_29.csv",
-        "synchronized_events_30.csv",
-        "synchronized_events_31.csv",
-        "synchronized_events_32.csv",        
+        "test 101 - sensor v1\synchronized_events_101.csv"
     ]
     
     all_dfs = []
@@ -224,26 +200,53 @@ if __name__ == "__main__":
         print(f"{target:12s} | MAE: {mae_target:8.4f} | R²: {r2_target:7.4f}")
 
     # --- PLOTTING SECTION ---
+    # Create the models parameters directory if it doesn't exist
+    MODELS_DIR = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\Thesis - Tactile Sensor\models paramters\regression"
+    os.makedirs(MODELS_DIR, exist_ok=True)
+
+    # Extract version number from the CSV filename
+    version = CSV_FILENAMES[0].split("sensor ")[1].split("\\")[0]
+    
     # Calculate grouped RMSE metrics
     calculate_grouped_rmse(y_test, predictions)
 
     # Plot all targets summary
     print("\nGenerating prediction plots...")
-    plot_all_targets_summary(y_test, predictions, OUTPUT_TARGETS)
+    summary_fig = plot_all_targets_summary(y_test, predictions, OUTPUT_TARGETS)
+    
+    # Save the summary plot with version number
+    summary_plot_path = os.path.join(MODELS_DIR, f'linear_regression_summary_{version}.png')
+    summary_fig.savefig(summary_plot_path, bbox_inches='tight', dpi=300)
+    plt.close(summary_fig)
 
     # --- 5. Save the Model and Scalers ---
     print("\n" + "="*70)
     print("SAVING MODEL AND SCALERS")
     print("="*70)
 
-    with open('linear_regression_models.pkl', 'wb') as f:
+    # Extract version number from the CSV filename
+    version = CSV_FILENAMES[0].split("sensor ")[1].split("\\")[0]  # This will extract "v2" from the filename
+    
+    # Create the models parameters directory if it doesn't exist
+    MODELS_DIR = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\Thesis - Tactile Sensor\models paramters\regression"
+    os.makedirs(MODELS_DIR, exist_ok=True)
+
+    # Save models dictionary with version
+    models_path = os.path.join(MODELS_DIR, f'linear_regression_models_{version}.pkl')
+    with open(models_path, 'wb') as f:
         pickle.dump(models, f)
-    with open('x_scaler_lr.pkl', 'wb') as f:
+
+    # Save input features scaler with version
+    x_scaler_path = os.path.join(MODELS_DIR, f'x_scaler_lr_{version}.pkl')
+    with open(x_scaler_path, 'wb') as f:
         pickle.dump(x_scaler, f)
-    with open('y_scalers_dict.pkl', 'wb') as f:
+
+    # Save output scalers dictionary with version
+    y_scalers_path = os.path.join(MODELS_DIR, f'y_scalers_dict_{version}.pkl')
+    with open(y_scalers_path, 'wb') as f:
         pickle.dump(y_scalers, f)
 
-    print("Models dictionary saved to: linear_regression_models.pkl")
-    print("X scaler saved to: x_scaler_lr.pkl")
-    print("Y scalers dictionary saved to: y_scalers_dict.pkl")
+    print(f"\nModels saved to: {models_path}")
+    print(f"X scaler saved to: {x_scaler_path}")
+    print(f"Y scalers saved to: {y_scalers_path}")
     print("\nProcess complete!")

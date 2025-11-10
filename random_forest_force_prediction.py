@@ -11,9 +11,9 @@ import pickle
 
 def plot_all_targets_summary(y_true, y_pred, target_names):
     n_targets = y_true.shape[1]
-    n_rows = (n_targets + 3) // 4
-    fig, axes = plt.subplots(n_rows, 4, figsize=(20, 5 * n_rows))
-    axes = axes.flatten()
+    fig, axes = plt.subplots(1, n_targets, figsize=(4*n_targets, 4))
+    if n_targets == 1:
+        axes = [axes]
     for i in range(n_targets):
         ax = axes[i]
         true_vals = y_true[:, i]; pred_vals = y_pred[:, i]
@@ -25,24 +25,36 @@ def plot_all_targets_summary(y_true, y_pred, target_names):
         ax.set_title(f'{target_names[i]}\nMAE: {mae:.2f} | R²: {r2:.3f}', fontsize=10)
         ax.set_xlabel('Actual', fontsize=8); ax.set_ylabel('Predicted', fontsize=8)
         ax.grid(True, alpha=0.3); ax.set_xlim(lims); ax.set_ylim(lims)
-    for i in range(n_targets, len(axes)):
-        axes[i].axis('off')
-    plt.tight_layout(); plt.show()
+    plt.tight_layout()
+    return fig
 
 def calculate_grouped_rmse(y_true, y_pred):
     contact_location_true, contact_location_pred = y_true[:, :2], y_pred[:, :2]
     force_vector_true, force_vector_pred = y_true[:, 2:5], y_pred[:, 2:5]
+    torque_vector_true, torque_vector_pred = y_true[:, 5:8], y_pred[:, 5:8]
+    
     contact_location_errors = contact_location_true - contact_location_pred
     contact_location_rmse = np.sqrt(np.mean(contact_location_errors ** 2))
+    
     force_vector_errors = force_vector_true - force_vector_pred
     force_vector_rmse = np.sqrt(np.mean(force_vector_errors ** 2))
+    
+    torque_vector_errors = torque_vector_true - torque_vector_pred
+    torque_vector_rmse = np.sqrt(np.mean(torque_vector_errors ** 2))
+    
     contact_euclidean_errors = np.sqrt(np.sum(contact_location_errors ** 2, axis=1))
     contact_euclidean_rmse = np.sqrt(np.mean(contact_euclidean_errors ** 2))
+    
     force_euclidean_errors = np.sqrt(np.sum(force_vector_errors ** 2, axis=1))
     force_euclidean_rmse = np.sqrt(np.mean(force_euclidean_errors ** 2))
+    
+    torque_euclidean_errors = np.sqrt(np.sum(torque_vector_errors ** 2, axis=1))
+    torque_euclidean_rmse = np.sqrt(np.mean(torque_euclidean_errors ** 2))
+    
     print("\n" + "="*70 + "\nGROUPED RMSE METRICS\n" + "="*70)
     print(f"\nContact Location (x, y):\n  - Component-wise RMSE: {contact_location_rmse:.4f} mm\n  - Euclidean RMSE:      {contact_euclidean_rmse:.4f} mm\n  - Mean error distance: {np.mean(contact_euclidean_errors):.4f} mm")
     print(f"\n3-DOF Force Vector (fx, fy, fz):\n  - Component-wise RMSE: {force_vector_rmse:.4f} N\n  - Euclidean RMSE:      {force_euclidean_rmse:.4f} N\n  - Mean error magnitude: {np.mean(force_euclidean_errors):.4f} N")
+    print(f"\n3-DOF Torque Vector (tx, ty, tz):\n  - Component-wise RMSE: {torque_vector_rmse:.4f} N·m\n  - Euclidean RMSE:      {torque_euclidean_rmse:.4f} N·m\n  - Mean error magnitude: {np.mean(torque_euclidean_errors):.4f} N·m")
 
 def plot_predictions(y_true, y_pred, target_index=2, target_names=None):
     if target_names is None:
@@ -77,35 +89,14 @@ def plot_predictions(y_true, y_pred, target_index=2, target_names=None):
 
 if __name__ == "__main__":
     # --- 1. Load and Preprocess Data ---
-    DATA_DIRECTORY = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\synchronized sensor and ATI" 
+    DATA_DIRECTORY = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data" 
     CSV_FILENAMES = [
-        "synchronized_events_1.csv",
-        "synchronized_events_2.csv",
-        "synchronized_events_3.csv",
-        "synchronized_events_4.csv",
-        "synchronized_events_5.csv",
-        "synchronized_events_6.csv",
-        "synchronized_events_7.csv",
-        "synchronized_events_8.csv",
-        "synchronized_events_12.csv",
-        "synchronized_events_21.csv",
-        "synchronized_events_22.csv",
-        "synchronized_events_23.csv",
-        "synchronized_events_24.csv",
-        "synchronized_events_25.csv",
-        "synchronized_events_26.csv",
-        "synchronized_events_27.csv",
-        "synchronized_events_28.csv",
-        "synchronized_events_29.csv",
-        "synchronized_events_30.csv",
-        "synchronized_events_31.csv",
-        "synchronized_events_32.csv",        
+        "test 110 - sensor v4\synchronized_events_110.csv"
     ]
     
     all_dfs = []
     # Define the columns you expect to have in the final clean DataFrame
-    expected_cols = ['t', 'b1', 'b2', 'b3', 'b4', 'b5', 'b6', 
-                     '-x (mm)', '-y (mm)', 'fx', 'fy', 'fz', 'tx', 'ty', 'tz']
+    expected_cols = ['t', 'b1', 'b2', 'b3', 'b4', 'b5', 'b6', '-x (mm)', '-y (mm)', 'fx', 'fy', 'fz', 'tx', 'ty', 'tz']
 
     for filename in CSV_FILENAMES:
         full_path = os.path.join(DATA_DIRECTORY, filename)
@@ -114,15 +105,15 @@ if __name__ == "__main__":
             continue
             
         try:
-            # Read CSV with more robust settings
+            # Read CSV 
             temp_df = pd.read_csv(full_path, skipinitialspace=True)
             
             # Clean column names
             temp_df.columns = temp_df.columns.str.strip()
             
-            # Print column names for debugging
+            '''# Print column names for debugging
             print(f"\nFile: {filename}")
-            print("Columns found:", temp_df.columns.tolist())
+            print("Columns found:", temp_df.columns.tolist())'''
             
             # Fix corrupted column names
             if '#NOME?' in temp_df.columns and '#NOME?.1' in temp_df.columns:
@@ -150,7 +141,7 @@ if __name__ == "__main__":
     print(f"Successfully combined {len(all_dfs)} files with {len(df)} total data points.")
 
     INPUT_FEATURES = ['b1', 'b2', 'b3', 'b4', 'b5', 'b6']
-    OUTPUT_TARGETS = ['-x (mm)', '-y (mm)', 'fx', 'fy', 'fz']
+    OUTPUT_TARGETS = ['-x (mm)', '-y (mm)', 'fx', 'fy', 'fz', 'tx', 'ty', 'tz']
     X = df[INPUT_FEATURES].values
     Y = df[OUTPUT_TARGETS].values
 
@@ -210,22 +201,45 @@ if __name__ == "__main__":
     print(f"\nOverall Test Set Metrics:\n  - MSE:         {mse:.4f}\n  - R-squared:   {r2:.4f}")
     
     calculate_grouped_rmse(y_test, predictions)
-    plot_all_targets_summary(y_test, predictions, OUTPUT_TARGETS)
+    fig = plot_all_targets_summary(y_test, predictions, OUTPUT_TARGETS)
+    plt.show()  # Display the plot during evaluation
+    plt.close(fig)
 
     print("\n" + "="*70 + "\nPER-TARGET PERFORMANCE METRICS\n" + "="*70)
     for i, target in enumerate(OUTPUT_TARGETS):
         mae_target = mean_absolute_error(y_test[:, i], predictions[:, i])
+        rmse_target = np.sqrt(mean_squared_error(y_test[:, i], predictions[:, i]))
         r2_target = r2_score(y_test[:, i], predictions[:, i])
-        print(f"{target:12s} | MAE: {mae_target:8.4f} | R²: {r2_target:7.4f}")
+        # Add appropriate unit based on the target
+        unit = "mm" if target in ['-x (mm)', '-y (mm)'] else "N"
+        print(f"{target:12s} | MAE: {mae_target:8.4f} {unit} | RMSE: {rmse_target:8.4f} {unit} | R²: {r2_target:7.4f}")
 
-    # --- 5. Save the Models and Scaler ---
-    print("\n" + "="*70 + "\nSAVING MODELS AND SCALER\n" + "="*70)
-
-    with open('specialized_rf_models.pkl', 'wb') as f:
+    # Clear any existing plots
+    plt.close('all')
+    
+    # --- 5. Save the Models, Scaler, and Plots ---
+    print("\n" + "="*70 + "\nSAVING MODELS, SCALER, AND PLOTS\n" + "="*70)
+    
+    # Create directory if it doesn't exist
+    save_dir = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\Thesis - Tactile Sensor\models paramters\Random Forest"
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Extract version number from the CSV filename
+    version = CSV_FILENAMES[0].split("sensor ")[1].split("\\")[0]  # This will extract "v1" from the filename
+    
+    # Save models and scaler with version
+    models_path = os.path.join(save_dir, f'specialized_rf_models_{version}.pkl')
+    scaler_path = os.path.join(save_dir, f'x_scaler_rf_{version}.pkl')
+    
+    with open(models_path, 'wb') as f:
         pickle.dump(models, f)
-    with open('x_scaler_rf.pkl', 'wb') as f:
+    with open(scaler_path, 'wb') as f:
         pickle.dump(x_scaler, f)
 
-    print("Dictionary of specialized models saved to: specialized_rf_models.pkl")
-    print("X scaler saved to: x_scaler_rf.pkl")
+    # Save and display summary plot with version
+    fig = plot_all_targets_summary(y_test, predictions, OUTPUT_TARGETS)
+    fig.savefig(os.path.join(save_dir, f'rf_all_targets_summary_{version}.png'), bbox_inches='tight', dpi=300)
+
+    print(f"Models and scaler saved to: {save_dir}")
+    print(f"Summary plot saved to: {save_dir}")
     print("\nProcess complete!")

@@ -90,15 +90,9 @@ def calculate_grouped_rmse(y_true, y_pred):
 if __name__ == "__main__":
     # --- 1. Load and Combine Data ---
     # This section remains unchanged
-    DATA_DIRECTORY = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\synchronized sensor and ATI"
+    DATA_DIRECTORY = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\synchronized Data"
     CSV_FILENAMES = [
-        "synchronized_events_1.csv", "synchronized_events_2.csv", "synchronized_events_3.csv",
-        "synchronized_events_4.csv", "synchronized_events_5.csv", "synchronized_events_6.csv",
-        "synchronized_events_7.csv", "synchronized_events_8.csv", "synchronized_events_12.csv",
-        "synchronized_events_21.csv", "synchronized_events_22.csv", "synchronized_events_23.csv",
-        "synchronized_events_24.csv", "synchronized_events_25.csv", "synchronized_events_26.csv",
-        "synchronized_events_27.csv", "synchronized_events_28.csv", "synchronized_events_29.csv",
-        "synchronized_events_30.csv", "synchronized_events_31.csv", "synchronized_events_32.csv",       
+        "synchronized_events_62.csv"    
     ]
     
     all_dfs = []
@@ -142,77 +136,128 @@ if __name__ == "__main__":
     # --- 2. Preprocess Data with a standard Train/Test Split ---
     X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.2, random_state=42)
     
+    # Scale input features
     x_scaler = StandardScaler()
     X_train_scaled = x_scaler.fit_transform(X_train)
     X_test_scaled = x_scaler.transform(X_test)
     
-    #-- MODIFIED: Use a single scaler for all targets
-    y_scaler = StandardScaler()
-    y_train_scaled = y_scaler.fit_transform(y_train)
-
-    # --- 3. Initialize and Train a SINGLE Multi-Output Model --- #-- MODIFIED SECTION
+    # Create separate scalers and models for each target
+    y_scalers = {}
+    models = {}
+    
     print("\n" + "="*70)
-    print("TRAINING A SINGLE MULTI-OUTPUT LINEAR REGRESSION MODEL")
+    print("TRAINING SEPARATE LINEAR REGRESSION MODELS FOR EACH TARGET")
     print("="*70)
     
-    #-- MODIFIED: Initialize one model instead of a dictionary of models
-    model = LinearRegression()
-    
-    print("Training the multi-output model...")
-    #-- MODIFIED: Fit the model once on all targets simultaneously
-    model.fit(X_train_scaled, y_train_scaled)
+    # Train a separate model for each target using all inputs
+    for i, target in enumerate(OUTPUT_TARGETS):
+        print(f"\nTraining model for {target}...")
+        
+        # Scale this target
+        y_scalers[target] = StandardScaler()
+        y_train_target = y_train[:, i].reshape(-1, 1)
+        y_train_scaled = y_scalers[target].fit_transform(y_train_target)
+        
+        # Train model for this target
+        models[target] = LinearRegression()
+        models[target].fit(X_train_scaled, y_train_scaled.ravel())
+        
+        # Quick training set R² score
+        train_r2 = models[target].score(X_train_scaled, y_train_scaled)
+        print(f"  - Training R² score: {train_r2:.4f}")
+        
+        # Print feature coefficients
+        coef = pd.DataFrame({
+            'Feature': INPUT_FEATURES,
+            'Coefficient': models[target].coef_
+        })
+        coef = coef.sort_values('Coefficient', key=abs, ascending=False)
+        print("\nFeature importance:")
+        print(coef.to_string(index=False))
 
-    print("Model trained successfully.")
-
-    # --- 4. Evaluate on TEST SET using the single model --- #-- MODIFIED SECTION
+    # --- 4. Evaluate on TEST SET using separate models ---
     print("\n" + "="*70)
     print("FINAL MODEL PERFORMANCE ON TEST SET")
     print("="*70)
     
-    #-- MODIFIED: Predict all targets in a single step
-    predictions_scaled = model.predict(X_test_scaled)
+    # Initialize array for all predictions
+    predictions = np.zeros_like(y_test)
     
-    #-- MODIFIED: Inverse transform all predictions at once
-    predictions = y_scaler.inverse_transform(predictions_scaled)
-
-    # --- Evaluation Metrics --- (This section remains the same)
-    mse = mean_squared_error(y_test, predictions)
-    r2 = r2_score(y_test, predictions)
-
-    print("\nFinal Test Set Metrics:")
-    print(f"  - MSE:         {mse:.4f}")
-    print(f"  - R-squared:   {r2:.4f}")
+    # Evaluate each model separately
+    overall_r2 = []
+    print("\nPer-Target Performance Metrics:")
+    print("-" * 50)
+    
+    for i, target in enumerate(OUTPUT_TARGETS):
+        # Get predictions for this target
+        y_test_target = y_test[:, i].reshape(-1, 1)
+        pred_scaled = models[target].predict(X_test_scaled).reshape(-1, 1)
+        pred_target = y_scalers[target].inverse_transform(pred_scaled)
+        
+        # Store predictions
+        predictions[:, i] = pred_target.ravel()
+        
+        # Calculate metrics
+        mae_target = mean_absolute_error(y_test_target, pred_target)
+        r2_target = r2_score(y_test_target, pred_target)
+        rmse_target = np.sqrt(mean_squared_error(y_test_target, pred_target))
+        
+        overall_r2.append(r2_target)
+        
+        print(f"\n{target}:")
+        print(f"  - MAE:  {mae_target:8.4f}")
+        print(f"  - RMSE: {rmse_target:8.4f}")
+        print(f"  - R²:   {r2_target:8.4f}")
+        print(f"  - Top coefficients:")
+        coef = pd.DataFrame({
+            'Feature': INPUT_FEATURES,
+            'Coefficient': models[target].coef_
+        })
+        coef = coef.sort_values('Coefficient', key=abs, ascending=False)
+        print(coef.head(3).to_string(index=False))
 
     print("\n" + "="*70)
-    print("PER-TARGET PERFORMANCE METRICS")
+    print("OVERALL MODEL PERFORMANCE")
     print("="*70)
-    for i, target in enumerate(OUTPUT_TARGETS):
-        mae_target = mean_absolute_error(y_test[:, i], predictions[:, i])
-        r2_target = r2_score(y_test[:, i], predictions[:, i])
-        print(f"{target:12s} | MAE: {mae_target:8.4f} | R²: {r2_target:7.4f}")
+    print(f"Average R² across all targets: {np.mean(overall_r2):.4f}")
 
-    # --- PLOTTING SECTION --- (This section remains the same)
+    # --- PLOTTING SECTION ---
     calculate_grouped_rmse(y_test, predictions)
     print("\nGenerating prediction plots...")
     plot_all_targets_summary(y_test, predictions, OUTPUT_TARGETS)
 
-    # --- 5. Save the Model and Scalers --- #-- MODIFIED SECTION
+    # --- 5. Save all Models and Scalers ---
     print("\n" + "="*70)
-    print("SAVING MODEL AND SCALERS")
+    print("SAVING MODELS AND SCALERS")
     print("="*70)
 
-    #-- MODIFIED: Save the single model object
-    with open('linear_regression_model.pkl', 'wb') as f:
-        pickle.dump(model, f)
-        
-    with open('x_scaler_lr.pkl', 'wb') as f:
-        pickle.dump(x_scaler, f)
-        
-    #-- MODIFIED: Save the single y_scaler object
-    with open('y_scaler_lr.pkl', 'wb') as f:
-        pickle.dump(y_scaler, f)
+    # Set models directory
+    MODELS_DIR = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\Thesis - Tactile Sensor\models paramters\regression"
+    os.makedirs(MODELS_DIR, exist_ok=True)
 
-    print("Single model saved to: linear_regression_model.pkl")
-    print("X scaler saved to: x_scaler_lr.pkl")
-    print("Y scaler saved to: y_scaler_lr.pkl")
+    # Save input scaler
+    x_scaler_path = os.path.join(MODELS_DIR, 'x_scaler_lr.pkl')
+    with open(x_scaler_path, 'wb') as f:
+        pickle.dump(x_scaler, f)
+    print(f"Input scaler saved to: {x_scaler_path}")
+    
+    # Save each model and its scaler
+    for target in OUTPUT_TARGETS:
+        # Clean filename by removing spaces and parentheses
+        clean_target = target.replace(" ", "_").replace("(", "").replace(")", "")
+        
+        # Save model
+        model_path = os.path.join(MODELS_DIR, f'linear_regression_model_{clean_target}.pkl')
+        with open(model_path, 'wb') as f:
+            pickle.dump(models[target], f)
+            
+        # Save scaler
+        scaler_path = os.path.join(MODELS_DIR, f'y_scaler_lr_{clean_target}.pkl')
+        with open(scaler_path, 'wb') as f:
+            pickle.dump(y_scalers[target], f)
+            
+        print(f"Model and scaler for {target} saved to:")
+        print(f"  - Model:  {model_path}")
+        print(f"  - Scaler: {scaler_path}")
+
     print("\nProcess complete!")

@@ -165,6 +165,7 @@ def plot_training_history(model):
     
     plt.tight_layout()
     plt.show()
+    return fig
 
 def plot_predictions(y_true, y_pred, target_index=2, target_names=None):
     if target_names is None:
@@ -200,9 +201,9 @@ def plot_predictions(y_true, y_pred, target_index=2, target_names=None):
 def plot_all_targets_summary(y_true, y_pred, target_names):
     """Plot a summary of all target predictions"""
     n_targets = y_true.shape[1]
-    n_rows = (n_targets + 3) // 4  # Calculate rows needed
-    fig, axes = plt.subplots(n_rows, 4, figsize=(20, 5*n_rows))
-    axes = axes.flatten()
+    fig, axes = plt.subplots(1, n_targets, figsize=(4*n_targets, 4))
+    if n_targets == 1:
+        axes = [axes]
     
     for i in range(n_targets):
         ax = axes[i]
@@ -228,12 +229,8 @@ def plot_all_targets_summary(y_true, y_pred, target_names):
         ax.set_xlim(lims)
         ax.set_ylim(lims)
     
-    # Hide unused subplots
-    for i in range(n_targets, len(axes)):
-        axes[i].axis('off')
-    
     plt.tight_layout()
-    plt.show()
+    return fig
 
 def calculate_grouped_rmse(y_true, y_pred):
     """Calculate RMSE for contact location and force vector separately"""
@@ -278,29 +275,9 @@ def calculate_grouped_rmse(y_true, y_pred):
 
 if __name__ == "__main__":
     # --- 1. Load and Combine Data ---
-    DATA_DIRECTORY = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\synchronized sensor and ATI"
+    DATA_DIRECTORY = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data" 
     CSV_FILENAMES = [
-        "synchronized_events_1.csv",
-        "synchronized_events_2.csv",
-        "synchronized_events_3.csv",
-        "synchronized_events_4.csv",
-        "synchronized_events_5.csv",
-        "synchronized_events_6.csv",
-        "synchronized_events_7.csv",
-        "synchronized_events_8.csv",
-        "synchronized_events_12.csv",
-        "synchronized_events_21.csv",
-        "synchronized_events_22.csv",
-        "synchronized_events_23.csv",
-        "synchronized_events_24.csv",
-        "synchronized_events_25.csv",
-        "synchronized_events_26.csv",
-        "synchronized_events_27.csv",
-        "synchronized_events_28.csv",
-        "synchronized_events_29.csv",
-        "synchronized_events_30.csv",
-        "synchronized_events_31.csv",
-        "synchronized_events_32.csv",        
+        "test 109 - sensor v1\synchronized_events_109.csv" 
     ]
 
     all_dfs = []
@@ -341,19 +318,8 @@ if __name__ == "__main__":
             print(f"Error reading {filename}: {str(e)}")
             continue
 
-        # Check if the dataframe has more than the expected 15 columns
-        if temp_df.shape[1] > 15:
-            # Assume the misplaced data is in the 16th and 17th columns (index 15 and 16)
-            corrupt_col_1 = temp_df.columns[15]
-            corrupt_col_2 = temp_df.columns[16]
-            
-            print(f"Found and fixing extra columns ('{corrupt_col_1}', '{corrupt_col_2}') in {filename}...")
-            
-            # Merge the data from the extra columns back into the correct ones
-            temp_df['-x (mm)'] = temp_df['-x (mm)'].fillna(temp_df[corrupt_col_1])
-            temp_df['-y (mm)'] = temp_df['-y (mm)'].fillna(temp_df[corrupt_col_2])
-
-        # Ensure the dataframe only contains the 15 expected columns in the correct order
+        # Ensure the dataframe contains only the expected columns in the correct order
+        # Remove any extra columns (like time_ns) and keep only the ones we need
         temp_df = temp_df[expected_cols]
         
         all_dfs.append(temp_df)
@@ -381,10 +347,10 @@ if __name__ == "__main__":
     print("="*70)
     
     # First split: separate test set (10%)
-    X_temp, X_test, y_temp, y_test = train_test_split(X, Y, test_size=0.1, random_state=42)
+    X_temp, X_test, y_temp, y_test = train_test_split(X, Y, test_size=0.20, random_state=42)
     
     # Second split: split remaining 90% into train (80%) and validation (20%)
-    X_train, X_val, y_train, y_val = train_test_split(X_temp, y_temp, test_size=0.2, random_state=42)
+    X_train, X_val, y_train, y_val = train_test_split(X_temp, y_temp, test_size=0.4, random_state=42)
     
     print(f"Training set:   {len(X_train)} samples ({len(X_train)/len(X)*100:.1f}%)")
     print(f"Validation set: {len(X_val)} samples ({len(X_val)/len(X)*100:.1f}%)")
@@ -408,7 +374,7 @@ if __name__ == "__main__":
     X_test_tensor = torch.from_numpy(X_test_scaled).float()
     y_test_tensor = torch.from_numpy(y_scaler.transform(y_test)).float()
 
-    batch_size = 64
+    batch_size = 2048*4
     train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
@@ -426,12 +392,12 @@ if __name__ == "__main__":
     model = RegressionModelNN(
         input_dims=len(INPUT_FEATURES),
         output_dims=len(OUTPUT_TARGETS),
-        fc_dims=[64, 32],
-        dropout_prob=0.1,
-        lr=0.0005,
+        fc_dims=[512, 256, 128, 64],
+        dropout_prob=0.3,
+        lr=0.01,
         weight_decay=1e-4
     )
-    print(model)
+    #print(model)
 
     # Train using VALIDATION set (not test set!)
     model.learn(train_loader, val_loader, num_epochs=500, y_scaler=y_scaler, early_stopping_patience=50)
@@ -448,9 +414,6 @@ if __name__ == "__main__":
     print(f"  - MAE:         {final_metrics['mae']:.4f}")
     print(f"  - R-squared:   {final_metrics['r2']:.4f}")
 
-    # Plot training history
-    plot_training_history(model)
-
     # Make predictions on test set
     predictions_scaled = model.predict(X_test_tensor)
     predictions = y_scaler.inverse_transform(predictions_scaled)
@@ -458,9 +421,10 @@ if __name__ == "__main__":
     # Calculate grouped RMSE metrics
     calculate_grouped_rmse(y_test, predictions)
 
-    # Plot all targets summary
+    # Create plots
     print("\nGenerating prediction plots...")
-    plot_all_targets_summary(y_test, predictions, OUTPUT_TARGETS)
+    history_fig = plot_training_history(model)
+    summary_fig = plot_all_targets_summary(y_test, predictions, OUTPUT_TARGETS)
 
     # Comparison table
     results_df = pd.DataFrame(y_test, columns=[f'Actual_{col}' for col in OUTPUT_TARGETS])
@@ -472,27 +436,90 @@ if __name__ == "__main__":
     print("="*70)
     print(comparison_df.head(10).round(2))
 
-    # Per-target metrics
+    # Per-target metrics for both validation and test sets
     print("\n" + "="*70)
-    print("PER-TARGET PERFORMANCE METRICS")
+    print("VALIDATION VS TEST SET PERFORMANCE METRICS")
     print("="*70)
+    
+    # Get validation set predictions
+    val_predictions_scaled = model.predict(X_val_tensor)
+    val_predictions = y_scaler.inverse_transform(val_predictions_scaled)
+    
+    print("\nValidation Set Metrics:")
+    print("-" * 50)
     for i, target in enumerate(OUTPUT_TARGETS):
-        mae = mean_absolute_error(y_test[:, i], predictions[:, i])
-        r2 = r2_score(y_test[:, i], predictions[:, i])
-        print(f"{target:12s} | MAE: {mae:8.4f} | R²: {r2:7.4f}")
+        val_mae = mean_absolute_error(y_val[:, i], val_predictions[:, i])
+        val_r2 = r2_score(y_val[:, i], val_predictions[:, i])
+        val_rmse = np.sqrt(np.mean((y_val[:, i] - val_predictions[:, i])**2))
+        print(f"{target:12s} | MAE: {val_mae:8.4f} | RMSE: {val_rmse:8.4f} | R²: {val_r2:7.4f}")
+    
+    print("\nTest Set Metrics:")
+    print("-" * 50)
+    for i, target in enumerate(OUTPUT_TARGETS):
+        test_mae = mean_absolute_error(y_test[:, i], predictions[:, i])
+        test_r2 = r2_score(y_test[:, i], predictions[:, i])
+        test_rmse = np.sqrt(np.mean((y_test[:, i] - predictions[:, i])**2))
+        print(f"{target:12s} | MAE: {test_mae:8.4f} | RMSE: {test_rmse:8.4f} | R²: {test_r2:7.4f}")
+    
+    # Define save directory for plots
+    save_dir = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\Thesis - Tactile Sensor\models paramters\NN"
+    
+    # Extract version number from the CSV filename (for plots)
+    version = CSV_FILENAMES[0].split("sensor ")[1].split("\\")[0]
+    
+    # Plot comparison of validation vs test performance
+    plt.figure(figsize=(12, 6))
+    x = np.arange(len(OUTPUT_TARGETS))
+    width = 0.35
+    
+    # Calculate R² scores
+    val_r2_scores = [r2_score(y_val[:, i], val_predictions[:, i]) for i in range(len(OUTPUT_TARGETS))]
+    test_r2_scores = [r2_score(y_test[:, i], predictions[:, i]) for i in range(len(OUTPUT_TARGETS))]
+    
+    plt.bar(x - width/2, val_r2_scores, width, label='Validation R²', alpha=0.8)
+    plt.bar(x + width/2, test_r2_scores, width, label='Test R²', alpha=0.8)
+    
+    plt.xlabel('Output Variables')
+    plt.ylabel('R² Score')
+    plt.title('Validation vs Test Set Performance')
+    plt.xticks(x, OUTPUT_TARGETS, rotation=45)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    # Save comparison plot with version
+    comparison_fig = plt.gcf()
+    comparison_fig.savefig(os.path.join(save_dir, f'validation_vs_test_comparison_{version}.png'))
+    plt.close()
 
     # --- 6. Save the Model and Scalers ---
     print("\n" + "="*70)
     print("SAVING MODEL AND SCALERS")
     print("="*70)
 
-    torch.save(model.state_dict(), 'improved_regression_model.pth')
-    with open('x_scaler.pkl', 'wb') as f:
+    # Extract version number from the CSV filename
+    version = CSV_FILENAMES[0].split("sensor ")[1].split("\\")[0]  # This will extract "v2" from the filename
+    
+    # Define save directory
+    save_dir = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\Thesis - Tactile Sensor\models paramters\NN"
+    
+    # Save model and scalers with version
+    model_path = os.path.join(save_dir, f'improved_regression_model_{version}.pth')
+    x_scaler_path = os.path.join(save_dir, f'x_scaler_{version}.pkl')
+    y_scaler_path = os.path.join(save_dir, f'y_scaler_{version}.pkl')
+
+    torch.save(model.state_dict(), model_path)
+    with open(x_scaler_path, 'wb') as f:
         pickle.dump(x_scaler, f)
-    with open('y_scaler.pkl', 'wb') as f:
+    with open(y_scaler_path, 'wb') as f:
         pickle.dump(y_scaler, f)
 
-    print("Model weights saved to: improved_regression_model.pth")
-    print("X scaler saved to: x_scaler.pkl")
-    print("Y scaler saved to: y_scaler.pkl")
+    print(f"Model weights saved to: {model_path}")
+    print(f"X scaler saved to: {x_scaler_path}")
+    print(f"Y scaler saved to: {y_scaler_path}")
+    
+    # Save plots to files with version
+    history_fig.savefig(os.path.join(save_dir, f'training_history_{version}.png'))
+    summary_fig.savefig(os.path.join(save_dir, f'predictions_summary_{version}.png'))
+
     print("\nTraining complete!")
