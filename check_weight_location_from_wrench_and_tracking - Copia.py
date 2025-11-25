@@ -1,482 +1,557 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Indenter tip path on the box top — rewritten to follow the wrench/contact
-transformations used in FullForceTactile.py, while preserving:
-- CLI args and tunables
-- input/output paths and filenames
-- CSV column names
-- plots (2D/3D paths and coordinate systems)
+Tip path on the box top — *no flattening* — with force/torque transformed into the Top frame
+using the same style of transformations from your external script (ATI→marker→camera→object/top),
+while keeping your original I/O layout and plots.
 
-Key differences vs the original:
-- "Top" frame is bound to the Object frame (no 45 mm offset).
-- "Tip" is the external contact point (marker-origin → contact offset),
-  expressed in Object ("Top") and Camera ("world") frames.
-- Forces/torques are transformed ATI → external marker → world (flip force)
-  → object, like in FullForceTactile.py.
+What this does
+--------------
+1) Load Atracsys (probe + box) and auto-detect which is which via motion variance.
+2) Pair by nearest timestamp.
+3) Pivot-calibrate the probe tip (still available, but a fixed offset can be used).
+4) Compute the tip position in CAMERA, then express it in the TOP frame that is
+   rigidly tied to the box geometry (no plane flattening).
+5) Transform ATI force/torque from ATI frame → probe marker frame → camera → top frame.
+6) Save a CSV of tip positions in the top frame and a processing CSV that includes
+   time, x/y positions (mm) and F/T in the top frame.
+7) Reproduce the same plots you had: 2D tip path on top and a 3D path. The 2D plot
+   shows a dashed rectangle giving ±1 mm margin around the path.
 
-Refs: FullForceTactile.py (force_transformation & contact) — see notes.
+Notes
+-----
+- PLANE_FLATTEN is disabled by default (as requested).
+- The ATI→marker rotation (R_ati_to_atimarker) is configurable. If you know the exact
+  orientation from your rig, update the constant below. Identity is used by default.
 """
 
 import os, sys, re, numpy as np, pandas as pd, matplotlib.pyplot as plt
 from typing import Tuple
 import argparse
+from matplotlib.patches import Rectangle
 
-# ------------------- User-tunable metadata (unchanged) -------------------
-test_num = 101
+# ==========================
+# ======  PATHS  ===========
+# ==========================
+# Keep the same directory pattern you used
+
+test_num = 109
 version_num = 1
-directory_to_datasets = os.path.abspath(
-    fr"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\test data\test {test_num} - sensor v{version_num}"
-)
+
+# Base folder where the raw files live for this test
+# (same pattern as before, auto-created if missing)
+directory_to_datasets = os.path.abspath(fr"C:\\Users\\aurir\\OneDrive - epfl.ch\\Thesis- Biorobotics Lab\\test data\\test {test_num} - sensor v{version_num}")
 if not os.path.exists(directory_to_datasets):
     os.makedirs(directory_to_datasets)
-    print(f"Created dataset directory: {directory_to_datasets}")
 
-ati_file = "ati_middle_trial{}.txt".format(test_num)
-atracsys_file = "atracsys_trial{}.txt".format(test_num)
+# File names (as before)
+ati_file = f"ati_middle_trial{test_num}.txt"
+atracsys_file = f"atracsys_trial{test_num}.txt"
+ATI_PATH = os.path.join(directory_to_datasets, ati_file)
+ATR_PATH = os.path.join(directory_to_datasets, atracsys_file)
 
-DATASET_DIRS: list[str] = [
-    os.path.join(directory_to_datasets, ati_file),
-    os.path.join(directory_to_datasets, atracsys_file),
-]
+# Output folders (unchanged)
+# 1) Out dir for plots + tip path CSV
+out_dir = os.path.join(directory_to_datasets, f"lin{test_num}")
+os.makedirs(out_dir, exist_ok=True)
+# 2) Processing dir (x,y + F/T top-frame CSV)
+processing_dir = os.path.abspath(fr"C:\\Users\\aurir\\OneDrive\\Desktop\\Thesis- Biorobotics Lab\\test data\\test {test_num} - sensor v{version_num}")
+os.makedirs(processing_dir, exist_ok=True)
 
-print(f"\nLooking for files:")
-print(f"ATI data file: {ati_file}")
-print(f"Atracsys file: {atracsys_file}")
-print(f"In directory: {directory_to_datasets}")
-
-# ------------------- Tunables (kept) -------------------
+# ==========================
+# ======  SETTINGS  ========
+# ==========================
 PAIR_TOL_S = 0.020
-PIVOT_SECONDS = 2.02           # unused now (tip comes from contact offset)
-PLANE_FLATTEN = True
+PIVOT_SECONDS = 0.02       # first seconds used for pivot LSQ (optional)
+PLANE_FLATTEN = False      # <—— requested: do not flatten
 
-# ---- "Other-code" (FullForce) tunables ----
-EXTERNAL_MOUNT = "bottom"      # 'bottom' | 'front' | 'side' (defaults from FullForce)
-VERSION_TAG    = "2024-02"     # matches constants in FullForce
-FLIP_FORCE_SIGN = True         # flip so force points into object
-# Fixed rotation: ATI sensor frame -> External marker frame (per mount)
-def Rz(deg): 
-    th = np.deg2rad(deg); c,s = np.cos(th), np.sin(th)
-    return np.array([[c,-s,0],[s,c,0],[0,0,1]], float)
-def Ry(deg):
-    th = np.deg2rad(deg); c,s = np.cos(th), np.sin(th)
-    return np.array([[c,0,s],[0,1,0],[-s,0,c]], float)
-def Rx(deg):
-    th = np.deg2rad(deg); c,s = np.cos(th), np.sin(th)
-    return np.array([[1,0,0],[0,c,-s],[0,s,c]], float)
+# Tip offset: you can either fix it, or use pivot from the first seconds
+USE_FIXED_TIP_OFFSET = True
+FIXED_TIP_OFFSET_IN_PROBE_m = np.array([-0.09, 0.0, -0.025])  # meters
 
-def get_R_marker_from_ATI(mount: str) -> np.ndarray:
-    """
-    Approximates FullForce's R_ati_to_atimarker_fingers for the external mounts.
-    - bottom:  Rotation.from_euler('zy', [48, 90])  -> Rz(48) @ Ry(90)
-    - front:   Rotation.from_euler('zy', [48, 180]) -> Rz(48) @ Ry(180)
-    - side:    Rotation.from_euler('zyx',[48,180,-90]) -> Rz(48) @ Ry(180) @ Rx(-90)
-    See: R_ati_to_atimarker_fingers[...] in FullForceTactile.py.
-    """
-    m = mount.lower()
-    if m == "bottom":
-        return Rz(48) @ Ry(90)
-    elif m == "front":
-        return Rz(48) @ Ry(180)
-    elif m == "side":
-        return Rz(48) @ Ry(180) @ Rx(-90)
-    else:
-        raise ValueError("EXTERNAL_MOUNT must be 'bottom'|'front'|'side'")
+# Force convention: point "into" the object (matches your external code style)
+FORCE_INTO_OBJECT = True
 
-# Contact offset in the external marker frame (mm), VERSION_TAG='2024-02'
-# marker_ori2pt = [86.48 + dx, 0.53 + dy, 28.57 + fiducial + dz]
-FIDUCIAL_RADIUS_mm = 12.5/2
-MOUNT_ERR = dict(bottom=(0.0, -1.0, 2.0), front=(-0.0, -1.0, 0.0), side=(0.0, 0.0, 0.0))
-def get_marker_ori2pt_m(mount: str) -> np.ndarray:
-    dx,dy,dz = MOUNT_ERR.get(mount.lower(), (0.0, -1.0, 2.0))
-    if mount.lower()=="bottom":
-        arr_mm = np.array([86.48 + dx, 0.53 + dy, 28.57 + FIDUCIAL_RADIUS_mm + dz], float)
-    elif mount.lower()=="front":
-        arr_mm = np.array([-(69-67), dy, -(54.95+20+FIDUCIAL_RADIUS_mm)], float)
-    elif mount.lower()=="side":
-        arr_mm = np.array([-(134.25-67), -41.59, 19+FIDUCIAL_RADIUS_mm], float)
-    else:
-        # default to bottom
-        arr_mm = np.array([86.48 + dx, 0.53 + dy, 28.57 + FIDUCIAL_RADIUS_mm + dz], float)
-    return arr_mm * 1e-3  # meters
+# ATI → probe-marker rotation.
+# If ATI axes are already aligned to the probe marker axes, leave as identity.
+# Otherwise, update with the measured calibration (e.g., Euler angles). 
+R_ati_to_atimarker = np.eye(3, dtype=float)
+# Example (commented):
+# from scipy.spatial.transform import Rotation
+# R_ati_to_atimarker = Rotation.from_euler('zx', [48, -90], degrees=True).as_matrix()
 
-# ------------------- IO helpers (kept; robust) -------------------
+# ==========================
+# ======  IO HELPERS  ======
+# ==========================
+
 def load_ati_data(path: str) -> pd.DataFrame:
-    """Load ATI F/T sensor data from text file."""
+    """Load ATI F/T sensor data and coerce numeric columns.
+       Expected columns include one time column and 3 force + 3 torque columns.
+    """
     try:
         df = pd.read_csv(path)
-        time_col = [col for col in df.columns if 'time' in col.lower()][0]
-        force_cols = [col for col in df.columns if 'force' in col.lower()]
-        torque_cols = [col for col in df.columns if 'torque' in col.lower()]
+        # Guess columns by regex
+        time_col = [c for c in df.columns if re.search('time', c, re.I)][0]
+        force_cols = [c for c in df.columns if re.search(r'force', c, re.I)]
+        torque_cols = [c for c in df.columns if re.search(r'torque', c, re.I)]
         df_processed = pd.DataFrame({
-            'time': df[time_col],
-            'Fx': df[force_cols[0]],
-            'Fy': df[force_cols[1]],
-            'Fz': df[force_cols[2]],
-            'Tx': df[torque_cols[0]],
-            'Ty': df[torque_cols[1]],
-            'Tz': df[torque_cols[2]]
-        }).astype(float)
-        # Normalize time to seconds range
+            'time': df[time_col].astype(float),
+            'Fx': df[force_cols[0]].astype(float),
+            'Fy': df[force_cols[1]].astype(float),
+            'Fz': df[force_cols[2]].astype(float),
+            'Tx': df[torque_cols[0]].astype(float),
+            'Ty': df[torque_cols[1]].astype(float),
+            'Tz': df[torque_cols[2]].astype(float),
+        })
+        # Normalize time units to seconds
         t = df_processed['time'].astype(float)
-        if t.abs().median()>1e12: df_processed['time']=t*1e-9
-        elif t.abs().median()>1e9: df_processed['time']=t*1e-6
-        elif t.abs().median()>1e6: df_processed['time']=t*1e-3
+        if t.abs().median() > 1e12:
+            df_processed['time'] = t * 1e-9
+        elif t.abs().median() > 1e9:
+            df_processed['time'] = t * 1e-6
+        elif t.abs().median() > 1e6:
+            df_processed['time'] = t * 1e-3
         return df_processed
     except Exception as e:
         print(f"Error loading ATI data: {e}")
         return None
 
+
 def load_atracsys_csv(path: str) -> pd.DataFrame:
     df = pd.read_csv(path, engine="python")
     df.columns = [c.strip() for c in df.columns]
-    def pick(regex: str) -> list[str]:
-        rx = re.compile(regex, re.IGNORECASE)
+
+    def pick(regex: str):
+        rx = re.compile(regex, re.I)
         cols = [c for c in df.columns if rx.fullmatch(c)]
-        return cols if cols else [c for c in df.columns if re.search(regex, c, re.IGNORECASE)]
+        return cols if cols else [c for c in df.columns if re.search(regex, c, re.I)]
+
     tcol = (pick(r"(?:%?time|field\.timestamp)") or ["t"])[0]
-    mid = ([c for c in df.columns if re.search("marker_id", c, re.IGNORECASE)])[0]
+    mid = [c for c in df.columns if re.search("marker_id", c, re.I)][0]
     pcols = [f"field.position{i}" for i in range(3)]
     if not all(c in df.columns for c in pcols):
-        pcols = [c for c in df.columns if re.search(r"position[0-2]$", c)]
-        assert len(pcols)==3, "position0..2 not found"
-        pcols = sorted(pcols, key=lambda s:int(re.search(r"(\d)$",s).group(1)))
+        pcols = sorted([c for c in df.columns if re.search(r"position[0-2]$", c)],
+                       key=lambda s: int(re.search(r"(\d)$", s).group(1)))
     rcols = [f"field.rotation{i}" for i in range(9)]
     if not all(c in df.columns for c in rcols):
-        rcols = [c for c in df.columns if re.search(r"rotation[0-8]$", c)]
-        assert len(rcols)==9, "rotation0..8 not found"
-        rcols = sorted(rcols, key=lambda s:int(re.search(r"(\d)$",s).group(1)))
-    df = df[[tcol, mid] + pcols + rcols].rename(columns={tcol:"t", mid:"marker_id"}).copy()
-    # time normalization
+        rcols = sorted([c for c in df.columns if re.search(r"rotation[0-8]$", c)],
+                       key=lambda s: int(re.search(r"(\d)$", s).group(1)))
+
+    df = df[[tcol, mid] + pcols + rcols].rename(columns={tcol: "t", mid: "marker_id"}).copy()
+
+    # Normalize time to seconds
     t = df["t"].astype(float)
-    if t.abs().median()>1e12: df["t"]=t*1e-9
-    elif t.abs().median()>1e9: df["t"]=t*1e-6
-    elif t.abs().median()>1e6: df["t"]=t*1e-3
-    # mm → m; pack R
-    df["px"] = df[pcols[0]].astype(float)*1e-3
-    df["py"] = df[pcols[1]].astype(float)*1e-3
-    df["pz"] = df[pcols[2]].astype(float)*1e-3
-    R = df[rcols].to_numpy(float).reshape((-1,3,3))
+    if t.abs().median() > 1e12:
+        df["t"] = t * 1e-9
+    elif t.abs().median() > 1e9:
+        df["t"] = t * 1e-6
+    elif t.abs().median() > 1e6:
+        df["t"] = t * 1e-3
+
+    df["px"] = df[pcols[0]].astype(float) * 1e-3
+    df["py"] = df[pcols[1]].astype(float) * 1e-3
+    df["pz"] = df[pcols[2]].astype(float) * 1e-3
+    R = df[rcols].to_numpy(float).reshape((-1, 3, 3))
     df["R"] = list(R)
-    return df[["t","marker_id","px","py","pz","R"]]
+    return df[["t", "marker_id", "px", "py", "pz", "R"]]
 
-def split_external_and_object(df: pd.DataFrame) -> Tuple[pd.DataFrame,pd.DataFrame]:
-    """Auto-detect moving 'external' vs steadier 'object' by motion variance (like probe/box)."""
+
+def split_probe_and_box(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     ids = df["marker_id"].unique()
-    assert len(ids)>=2, "Need at least two marker_ids."
-    stats=[]
+    assert len(ids) >= 2, "Need at least two marker_ids."
+    stats = []
     for k in ids:
-        p=df[df["marker_id"]==k][["px","py","pz"]].to_numpy()
-        stats.append((k, float(np.var(p,axis=0).sum())))
+        p = df[df["marker_id"] == k][["px", "py", "pz"]].to_numpy()
+        stats.append((k, float(np.var(p, axis=0).sum())))
     stats.sort(key=lambda x: x[1])
-    object_id, external_id = stats[0][0], stats[-1][0]
-    ext   = df[df["marker_id"]==external_id].sort_values("t").reset_index(drop=True)
-    obj   = df[df["marker_id"]==object_id ].sort_values("t").reset_index(drop=True)
-    return ext, obj
+    box_id, probe_id = stats[0][0], stats[-1][0]
+    box = df[df["marker_id"] == box_id].sort_values("t").reset_index(drop=True)
+    probe = df[df["marker_id"] == probe_id].sort_values("t").reset_index(drop=True)
+    return probe, box
 
-def asof_join(a_df: pd.DataFrame, b_df: pd.DataFrame, tol_s: float, 
-              a_cols=("t","px","py","pz","R"), b_cols=("t","px","py","pz","R")) -> pd.DataFrame:
-    a = a_df[list(a_cols)].copy(); a.columns=["t","ax","ay","az","AR"]
-    b = b_df[list(b_cols)].copy(); b.columns=["t_b","bx","by","bz","BR"]
-    out = pd.merge_asof(a.sort_values("t"), b.sort_values("t_b"),
-                        left_on="t", right_on="t_b",
-                        direction="nearest", tolerance=tol_s).dropna(subset=["t_b"])
-    return out.reset_index(drop=True)
 
-# ------------------- Homogeneous transforms (kept) -------------------
+def asof_join(probe: pd.DataFrame, box: pd.DataFrame, tol_s: float) -> pd.DataFrame:
+    a = probe[["t", "px", "py", "pz", "R"]].copy(); a.columns = ["t", "ppx", "ppy", "ppz", "PR"]
+    b = box[["t", "px", "py", "pz", "R"]].copy(); b.columns = ["t_box", "bpx", "bpy", "bpz", "BR"]
+    out = pd.merge_asof(
+        a.sort_values("t"), b.sort_values("t_box"),
+        left_on="t", right_on="t_box", direction="nearest", tolerance=tol_s
+    ).dropna(subset=["t_box"]).reset_index(drop=True)
+    return out
+
+# ==========================
+# =======  MATH  ===========
+# ==========================
+
 def make_homogeneous_matrices(Rs: np.ndarray, ts: np.ndarray) -> np.ndarray:
     Rs = np.asarray(Rs); ts = np.asarray(ts)
-    if Rs.ndim==2: Rs = Rs[np.newaxis,...]
-    if ts.ndim==1: ts = ts[np.newaxis,...]
-    if Rs.shape[0]!=ts.shape[0]: raise ValueError("Rs and ts length mismatch")
+    if Rs.ndim == 2: Rs = Rs[np.newaxis, ...]
+    if ts.ndim == 1: ts = ts[np.newaxis, ...]
+    if Rs.shape[0] != ts.shape[0]:
+        raise ValueError("Rs and ts must have same leading length")
     N = Rs.shape[0]
-    Ts = np.zeros((N,4,4), dtype=Rs.dtype)
+    Ts = np.zeros((N, 4, 4), dtype=Rs.dtype)
     Ts[:, :3, :3] = Rs
-    Ts[:, :3, 3]  = ts
-    Ts[:, 3, 3]   = 1.0
+    Ts[:, :3, 3] = ts
+    Ts[:, 3, 3] = 1.0
     return Ts
+
 
 def invert_homogeneous_matrices(Ts: np.ndarray) -> np.ndarray:
     Ts = np.asarray(Ts)
-    if Ts.ndim==2: Ts = Ts[np.newaxis,...]
-    R = Ts[:, :3, :3]; t = Ts[:, :3, 3]
-    Rinv = np.transpose(R, (0,2,1))
+    if Ts.ndim == 2: Ts = Ts[np.newaxis, ...]
+    R = Ts[:, :3, :3]
+    t = Ts[:, :3, 3]
+    Rinv = np.transpose(R, (0, 2, 1))
     tinv = -np.einsum("nij,nj->ni", Rinv, t)
     out = np.zeros_like(Ts)
     out[:, :3, :3] = Rinv
-    out[:, :3, 3]  = tinv
-    out[:, 3, 3]   = 1.0
+    out[:, :3, 3] = tinv
+    out[:, 3, 3] = 1.0
     return out
+
 
 def apply_homogeneous_matrices(Ts: np.ndarray, points: np.ndarray) -> np.ndarray:
     Ts = np.asarray(Ts); points = np.asarray(points)
-    if Ts.ndim==2: Ts = Ts[np.newaxis,...]
+    if Ts.ndim == 2: Ts = Ts[np.newaxis, ...]
     N = Ts.shape[0]
-    if points.ndim==1:
-        p_h = np.concatenate([points,[1.0]])
+    if points.ndim == 1:
+        p_h = np.concatenate([points, [1.0]])
         res_h = Ts @ p_h
         return res_h[:, :3]
-    elif points.ndim==2:
-        if points.shape[0]!=N: raise ValueError("points length != transforms")
-        p_h = np.concatenate([points, np.ones((N,1))], axis=1)
+    elif points.ndim == 2:
+        if points.shape[0] != N:
+            raise ValueError("When providing per-sample points, number of points must equal number of transforms")
+        p_h = np.concatenate([points, np.ones((N, 1))], axis=1)
         res = np.einsum("nij,nj->ni", Ts, p_h)
         return res[:, :3]
     else:
-        raise ValueError("points must be (3,) or (N,3)")
+        raise ValueError("points must be shape (3,) or (N,3)")
 
-# ------------------- Plane fit (kept) -------------------
-def best_fit_plane(points: np.ndarray):
-    ctr = points.mean(axis=0)
-    P = points - ctr
-    _, _, vh = np.linalg.svd(P, full_matrices=False)
-    n = vh[-1,:]; n /= np.linalg.norm(n)
-    z = np.array([0.,0.,1.]); v = np.cross(z,n); s = np.linalg.norm(v); c = float(np.dot(z,n))
-    if s<1e-8:
-        R = np.eye(3) if c>0 else np.diag([1,1,-1])
-    else:
-        vx = np.array([[0,-v[2],v[1]],[v[2],0,-v[0]],[-v[1],v[0],0]])
-        R = np.eye(3) + vx + vx@vx * ((1-c)/(s**2))
-    return ctr, n, R
 
-# ------------------- Wrench/contact per FullForce -------------------
-def transform_wrench_to_object(F_ati: np.ndarray, T_ati: np.ndarray,
-                               R_C_ext: np.ndarray, R_C_obj: np.ndarray,
-                               R_ext_ATI: np.ndarray, flip_force: bool=True) -> Tuple[np.ndarray,np.ndarray]:
+def set_axes_equal_3d(ax, xs, ys, zs, margin_mm=10.0):
+    """Set equal scaling on a mplot3d axis using the provided data (in mm).
+    Centers the axes on the data and adds an optional margin in mm.
     """
-    F_ati, T_ati             : (N,3) in ATI frame
-    R_C_ext, R_C_obj         : (N,3,3) Camera(world)←External/Obj rotation matrices
-    R_ext_ATI                : (3,3) External marker ← ATI
-    Returns F_obj, T_obj     : (N,3) in Object frame
-    """
-    # world ← ATI : R_C_ext @ R_ext_ATI
-    R_world_ATI = np.einsum("nij,jk->nik", R_C_ext, R_ext_ATI)
-    F_world = np.einsum("nij,nj->ni", R_world_ATI, F_ati)
-    T_world = np.einsum("nij,nj->ni", R_world_ATI, T_ati)
-    if flip_force: F_world = -F_world
-    # object ← world : R_obj^T
-    R_obj_T = np.transpose(R_C_obj, (0,2,1))
-    F_obj = np.einsum("nij,nj->ni", R_obj_T, F_world)
-    T_obj = np.einsum("nij,nj->ni", R_obj_T, T_world)
-    return F_obj, T_obj
+    # compute ranges
+    x_min, x_max = float(np.nanmin(xs)), float(np.nanmax(xs))
+    y_min, y_max = float(np.nanmin(ys)), float(np.nanmax(ys))
+    z_min, z_max = float(np.nanmin(zs)), float(np.nanmax(zs))
+    x_mid = 0.5 * (x_min + x_max)
+    y_mid = 0.5 * (y_min + y_max)
+    z_mid = 0.5 * (z_min + z_max)
+    rx = max(x_max - x_min, 1e-3) / 2.0
+    ry = max(y_max - y_min, 1e-3) / 2.0
+    rz = max(z_max - z_min, 1e-3) / 2.0
+    R = max(rx, ry, rz) + margin_mm
+    ax.set_xlim(x_mid - R, x_mid + R)
+    ax.set_ylim(y_mid - R, y_mid + R)
+    ax.set_zlim(z_mid - R, z_mid + R)
+    # Prefer set_box_aspect for consistent rendering if available
+    try:
+        ax.set_box_aspect([1, 1, 1])
+    except Exception:
+        pass
 
-def compute_contact_positions(R_C_ext: np.ndarray, p_ext_C: np.ndarray,
-                              R_C_obj: np.ndarray, p_obj_C: np.ndarray,
-                              marker_ori2pt_m: np.ndarray) -> Tuple[np.ndarray,np.ndarray]:
-    """
-    Returns:
-      tip_C   : (N,3) contact in Camera/world
-      tip_obj : (N,3) contact in Object frame
-    """
-    # world contact
-    offset_world = np.einsum("nij,j->ni", R_C_ext, marker_ori2pt_m)
-    tip_C = p_ext_C + offset_world
-    # object frame
-    R_obj_T = np.transpose(R_C_obj, (0,2,1))
-    tip_obj = np.einsum("nij,nj->ni", R_obj_T, (tip_C - p_obj_C))
-    return tip_C, tip_obj
 
-# ------------------- Main -------------------
+def pivot_calibrate(R_C_P: np.ndarray, pP_C: np.ndarray):
+    """Least-squares pivot: solve R_i p + t_i = s for p (tip in probe) and s (tip in camera)."""
+    N = R_C_P.shape[0]
+    A = np.zeros((3*N, 6)); b = np.zeros(3*N)
+    for i in range(N):
+        A[3*i:3*i+3, 0:3] = R_C_P[i]
+        A[3*i:3*i+3, 3:6] = -np.eye(3)
+        b[3*i:3*i+3] = -pP_C[i]
+    x, *_ = np.linalg.lstsq(A, b, rcond=None)
+    p_tip_probe = x[:3]; tip_cam = x[3:]
+    return p_tip_probe, tip_cam
+
+# ==========================
+# =======  MAIN  ===========
+# ==========================
+
 def main(atracsys_path: str, test_num: int):
-    base_dir = os.path.dirname(os.path.abspath(atracsys_path))
-    out_dir = os.path.join(base_dir, f"lin{test_num}")
-    os.makedirs(out_dir, exist_ok=True)
-
-    processing_dir = os.path.abspath(
-        fr"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\test data\test {test_num} - sensor v{version_num}"
-    )
-    os.makedirs(processing_dir, exist_ok=True)
-
-    # Load ATI (raw, seconds)
-    ati_path = os.path.join(base_dir, f"ati_middle_trial{test_num}.txt")
-    ati_data = load_ati_data(ati_path) if os.path.exists(ati_path) else None
-
-    # Load Atracsys
+    # Load ATI (optional) and Atracsys
+    ati_data = load_ati_data(ATI_PATH) if os.path.exists(ATI_PATH) else None
     df = load_atracsys_csv(atracsys_path)
-    external, obj = split_external_and_object(df)
 
-    # Pair external↔object
-    F = asof_join(external, obj, PAIR_TOL_S)
-    tt = F["t"].to_numpy()
-    pExt_C = F[["ax","ay","az"]].to_numpy()
-    pObj_C = F[["bx","by","bz"]].to_numpy()
-    R_C_ext = np.stack(F["AR"].to_numpy())
-    R_C_obj = np.stack(F["BR"].to_numpy())
+    # Identify probe vs box; join by nearest time
+    probe, box = split_probe_and_box(df)
+    F = asof_join(probe, box, PAIR_TOL_S)
 
-    # --- Contact point (this is your "tip") ---
-    R_ext_ATI = get_R_marker_from_ATI(EXTERNAL_MOUNT)
-    marker_ori2pt = get_marker_ori2pt_m(EXTERNAL_MOUNT)
-    tip_C, tip_in_obj = compute_contact_positions(R_C_ext, pExt_C, R_C_obj, pObj_C, marker_ori2pt)
+    # Arrays
+    pP_C = F[["ppx", "ppy", "ppz"]].to_numpy()          # probe origin in camera
+    R_C_P = np.stack(F["PR"].to_numpy())                   # probe rotation in camera
+    pB_C = F[["bpx", "bpy", "bpz"]].to_numpy()          # box origin in camera
+    R_C_B = np.stack(F["BR"].to_numpy())                   # box rotation in camera
+    tt    = F["t"].to_numpy()
 
-    # Bind "Top" to Object to preserve your outputs/plots
-    R_C_T = R_C_obj.copy()
-    top_origin_C = pObj_C.copy()
+    # Tip offset
+    M = min(len(R_C_P), max(1, int(PIVOT_SECONDS / max(1e-6, np.median(np.diff(tt))))) )
+    p_tip_probe_pivot, _ = pivot_calibrate(R_C_P[:M], pP_C[:M])
+    p_tip_probe = FIXED_TIP_OFFSET_IN_PROBE_m if USE_FIXED_TIP_OFFSET else p_tip_probe_pivot
+
+    # Tip in camera
+    T_C_P = make_homogeneous_matrices(R_C_P, pP_C)
+    tip_C = apply_homogeneous_matrices(T_C_P, np.asarray(p_tip_probe, float))   # (N,3)
+
+    # -------- Box→Top (no flattening) --------
+    # Same rigid mapping as your previous script (columns = Top axes in Box frame)
+    R_B_T = np.array([[1.0, 0.0, 0.0],
+                      [0.0, 0.0, 1.0],
+                      [0.0, 1.0, 0.0]], dtype=float)
+    # Top origin offset in Box axes (meters). Adjust if needed.
+    d_T_in_B = np.array([0.03, -0.041, 0.030], dtype=float)
+
+    # Compose to Camera
+    R_C_T = np.matmul(R_C_B, R_B_T)                               # (N,3,3)
+    top_origin_C = pB_C + np.einsum('nij,j->ni', R_C_B, d_T_in_B) # (N,3)
+
+    # Top transforms
     T_C_Top = make_homogeneous_matrices(R_C_T, top_origin_C)
     T_Top_C = invert_homogeneous_matrices(T_C_Top)
-    tip_in_top = tip_in_obj  # since Top ≡ Object
 
-    # Optional flatten (points only)
-    tip_in_top_flat = None
-    if PLANE_FLATTEN:
-        ctr, n, R_flat = best_fit_plane(tip_in_top)
-        tip_in_top_flat = (tip_in_top - ctr) @ R_flat + ctr
+    # Tip in Top frame (unflattened)
+    tip_in_top = apply_homogeneous_matrices(T_Top_C, tip_C)       # (N,3)
+    X_top, Y_top, Z_top = tip_in_top[:, 0], tip_in_top[:, 1], tip_in_top[:, 2]
 
-    # Un/flattened split
-    X_top, Y_top, Z_top = tip_in_top[:,0], tip_in_top[:,1], tip_in_top[:,2]
-    if tip_in_top_flat is not None:
-        X_top_flat, Y_top_flat, Z_top_flat = tip_in_top_flat[:,0], tip_in_top_flat[:,1], tip_in_top_flat[:,2]
-    else:
-        X_top_flat = Y_top_flat = Z_top_flat = None
-
-    # Center (unflattened)
-    cx = 0.5*(np.nanmin(X_top)+np.nanmax(X_top))
-    cy = 0.5*(np.nanmin(Y_top)+np.nanmax(Y_top))
+    # Center for prettier plots (doesn't change underlying data)
+    cx = 0.5 * (np.nanmin(X_top) + np.nanmax(X_top))
+    cy = 0.5 * (np.nanmin(Y_top) + np.nanmax(Y_top))
     cz = np.nanmedian(Z_top)
-    Xc, Yc, Zc = X_top-cx, Y_top-cy, Z_top-cz
+    Xc, Yc, Zc = X_top - cx, Y_top - cy, Z_top - cz
 
-    # Center (flattened)
-    if tip_in_top_flat is not None:
-        cxf = 0.5*(np.nanmin(X_top_flat)+np.nanmax(X_top_flat))
-        cyf = 0.5*(np.nanmin(Y_top_flat)+np.nanmax(Y_top_flat))
-        czf = np.nanmedian(Z_top_flat)
-        Xc_f, Yc_f, Zc_f = X_top_flat-cxf, Y_top_flat-cyf, Z_top_flat-czf
-
-    # ---- CSV (tip path) ----
-    out_df = pd.DataFrame({
-        "t": tt,
-        # Object frame (named "Top" to keep your schema)
-        "tip_x_top_m": X_top, "tip_y_top_m": Y_top, "tip_z_top_m": Z_top,
-        "tip_x_top_centered_m": Xc, "tip_y_top_centered_m": Yc, "tip_z_top_centered_m": Zc,
-        **({} if tip_in_top_flat is None else {
-            "tip_x_top_flat_m": X_top_flat, "tip_y_top_flat_m": Y_top_flat, "tip_z_top_flat_m": Z_top_flat,
-            "tip_x_top_flat_centered_m": Xc_f, "tip_y_top_flat_centered_m": Yc_f, "tip_z_top_flat_centered_m": Zc_f,
-        }),
-        # Camera/world contact for traceability
-        "tip_x_cam_m": tip_C[:,0], "tip_y_cam_m": tip_C[:,1], "tip_z_cam_m": tip_C[:,2],
-        # Legacy calibration/debug columns (kept, not used)
-        "p_tip_probe_x_m": [0.0]*len(tt), "p_tip_probe_y_m": [0.0]*len(tt), "p_tip_probe_z_m": [0.0]*len(tt),
-        "top_center_shift_m_x": [cx]*len(tt), "top_center_shift_m_y": [cy]*len(tt), "top_center_shift_m_z": [cz]*len(tt),
+    # --------------- Save tip path CSV ---------------
+    tip_csv = pd.DataFrame({
+        't': tt,
+        'tip_x_top_m': X_top, 'tip_y_top_m': Y_top, 'tip_z_top_m': Z_top,
+        'tip_x_top_centered_m': Xc, 'tip_y_top_centered_m': Yc, 'tip_z_top_centered_m': Zc,
+        'tip_x_cam_m': tip_C[:, 0], 'tip_y_cam_m': tip_C[:, 1], 'tip_z_cam_m': tip_C[:, 2],
+        'p_tip_probe_x_m': [p_tip_probe[0]]*len(tt),
+        'p_tip_probe_y_m': [p_tip_probe[1]]*len(tt),
+        'p_tip_probe_z_m': [p_tip_probe[2]]*len(tt),
+        'top_center_shift_m_x': [cx]*len(tt),
+        'top_center_shift_m_y': [cy]*len(tt),
+        'top_center_shift_m_z': [cz]*len(tt),
     })
-    csv_path = os.path.join(out_dir, f"tip_path_top_frame_trial{test_num} - Zero version.csv")
-    out_df.to_csv(csv_path, index=False); print(f"Saved CSV: {csv_path}")
+    csv_path = os.path.join(out_dir, f"tip_path_top_frame_trial{test_num}.csv")
+    tip_csv.to_csv(csv_path, index=False)
+    print(f"Saved CSV: {csv_path}")
 
-    # ---- Sanity checks (determinant, etc.) ----
-    det_median = np.median([np.linalg.det(R) for R in R_C_T])
-    print(f"Median det(R_C_T): {det_median:.6f} (should be ~+1)")
-    normal_dot_z = np.median(np.einsum('ni,i->n', R_C_T[:,:,2], np.array([0,0,1])))
-    print(f"Median normal·camera+Z: {normal_dot_z:.6f}")
-    print(f"\nContact (Top/Object) stats:")
-    print(f"X range: [{np.min(X_top):.3f}, {np.max(X_top):.3f}] m")
-    print(f"Y range: [{np.min(Y_top):.3f}, {np.max(Y_top):.3f}] m")
-    print(f"Z mean ± std: {np.mean(Z_top):.3f} ± {np.std(Z_top):.3f} m\n")
+    # --------------- Plots (same style, but no flatten) ---------------
+    # 2D top plot with ±1 mm error rectangle around the path extents
+    Xmm, Ymm = X_top*1e3, Y_top*1e3
+    x_min, x_max = float(np.nanmin(Xmm)), float(np.nanmax(Xmm))
+    y_min, y_max = float(np.nanmin(Ymm)), float(np.nanmax(Ymm))
+    pad = 1.0  # mm
 
-    # ---- Plots (unchanged look/paths) ----
-    Xp, Yp, Zp = (X_top_flat, Y_top_flat, Z_top_flat) if tip_in_top_flat is not None else (X_top, Y_top, Z_top)
-    plt.figure()
-    plt.plot(Xp*1e3, Yp*1e3, linewidth=1.2)
-    plt.axis("equal"); plt.grid(True, alpha=0.3)
+    plt.figure(figsize=(8, 6))
+    plt.plot(Xmm, Ymm, linewidth=1.2)
+    # Error rectangle (±1 mm around the path bounding box)
+    rect = Rectangle((x_min - pad, y_min - pad),
+                     (x_max - x_min) + 2*pad, (y_max - y_min) + 2*pad,
+                     fill=False, linestyle='--', linewidth=1.0, alpha=0.7)
+    ax = plt.gca(); ax.add_patch(rect)
+    plt.grid(True, alpha=0.3)
+    
+    plt.xlim([-25, 25])
+    plt.ylim([-10, 10])
     plt.xlabel("Top X [mm]"); plt.ylabel("Top Y [mm]")
-    plt.title(f"Tip path on top surface ({'flattened' if tip_in_top_flat is not None else 'unflattened'}) — trial {test_num} - Zero version")
-    fig2d_nc_path = os.path.join(out_dir, f"tip_path_top_xy_{'flat' if tip_in_top_flat is not None else 'raw'}_trial{test_num} - Zero version.png")
-    plt.savefig(fig2d_nc_path, dpi=220, bbox_inches="tight"); plt.show()
-    print(f"Saved plot: {fig2d_nc_path}")
+    plt.title(f"Tip path on top surface (no flatten) — trial {test_num}")
+    fig2d_path = os.path.join(out_dir, f"tip_path_top_xy_raw_trial{test_num}.png")
+    plt.savefig(fig2d_path, dpi=220, bbox_inches="tight")
+    plt.show()
+    print(f"Saved plot: {fig2d_path}")
 
-    fig_nc = plt.figure()
-    ax_nc = fig_nc.add_subplot(111, projection="3d")
-    ax_nc.plot(Xp*1e3, Yp*1e3, Zp*1e3, linewidth=1.0)
-    ax_nc.set_xlabel("Top X [mm]"); ax_nc.set_ylabel("Top Y [mm]"); ax_nc.set_zlabel("Top Z [mm]")
-    ax_nc.set_title(f"Tip path in Top frame ({'flattened' if tip_in_top_flat is not None else 'unflattened'}) — trial {test_num} - Zero version")
-    ax_nc.set_box_aspect([1,1,0.3])
-    fig3d_nc_path = os.path.join(out_dir, f"tip_path_top_3d_{'flat' if tip_in_top_flat is not None else 'raw'}_trial{test_num} - Zero version.png")
-    plt.savefig(fig3d_nc_path, dpi=220, bbox_inches="tight"); plt.show()
-    print(f"Saved plot: {fig3d_nc_path}")
+    # 3D path in Top frame
+    fig3d = plt.figure()
+    ax3 = fig3d.add_subplot(111, projection='3d')
+    ax3.plot(Xmm, Ymm, Z_top*1e3, linewidth=1.0)
+    ax3.set_xlabel("Top X [mm]"); ax3.set_ylabel("Top Y [mm]"); ax3.set_zlabel("Top Z [mm]")
+    ax3.set_title(f"Tip path in Top frame (no flatten) — trial {test_num}")
+    # Improve tick font sizes for readability
+    try:
+        ax3.xaxis.set_tick_params(labelsize=9)
+        ax3.yaxis.set_tick_params(labelsize=9)
+        ax3.zaxis.set_tick_params(labelsize=9)
+    except Exception:
+        pass
+    # set equal aspect and reasonable limits around data (centered)
+    set_axes_equal_3d(ax3, Xmm, Ymm, Z_top*1e3, margin_mm=12.0)
+    fig3d_path = os.path.join(out_dir, f"tip_path_top_3d_raw_trial{test_num}.png")
+    plt.savefig(fig3d_path, dpi=220, bbox_inches="tight")
+    plt.show()
+    print(f"Saved plot: {fig3d_path}")
 
-    # Coordinate systems in camera
-    fig_coords = plt.figure(figsize=(10, 8))
-    ax_coords = fig_coords.add_subplot(111, projection="3d")
-    ax_coords.plot(external["px"].to_numpy()*1e3, external["py"].to_numpy()*1e3, external["pz"].to_numpy()*1e3, 'b-', label='External Path', alpha=0.5)
-    ax_coords.plot(obj["px"].to_numpy()*1e3, obj["py"].to_numpy()*1e3, obj["pz"].to_numpy()*1e3, 'r-', label='Object Path', alpha=0.5)
-    ax_coords.plot(tip_C[:,0]*1e3, tip_C[:,1]*1e3, tip_C[:,2]*1e3, 'g-', label='Contact Path', alpha=0.5)
-    z_min_idx = np.argmin(tip_C[:,2]); axis_length = 0.05*1e3
-    print(f"\nAxes at index {z_min_idx} (t={tt[z_min_idx]:.3f}s)")
-    origin_tip = tip_C[z_min_idx]*1e3
-    for i,(c,lbl) in enumerate([('r','Tip X'),('g','Tip Y'),('b','Tip Z')]):
-        direction = R_C_ext[z_min_idx,:,i]*axis_length
-        ax_coords.quiver(origin_tip[0],origin_tip[1],origin_tip[2], direction[0],direction[1],direction[2], color=c, alpha=1.0, label=lbl)
-    origin_E = pExt_C[z_min_idx]*1e3
-    for i,(c,lbl) in enumerate([('r','Ext X'),('g','Ext Y'),('b','Ext Z')]):
-        direction = R_C_ext[z_min_idx,:,i]*axis_length
-        ax_coords.quiver(origin_E[0],origin_E[1],origin_E[2], direction[0],direction[1],direction[2], color=c, alpha=0.6, label=lbl)
-    origin_O = pObj_C[z_min_idx]*1e3
-    for i,(c,lbl) in enumerate([('r','Obj X'),('g','Obj Y'),('b','Obj Z')]):
-        direction = R_C_obj[z_min_idx,:,i]*axis_length
-        ax_coords.quiver(origin_O[0],origin_O[1],origin_O[2], direction[0],direction[1],direction[2], color=c, alpha=0.6, label=lbl)
-    ax_coords.set_xlabel('Camera X [mm]'); ax_coords.set_ylabel('Camera Y [mm]'); ax_coords.set_zlabel('Camera Z [mm]')
-    ax_coords.legend(); ax_coords.set_title('External/Object Coordinate Systems in Camera Frame')
-    coords_path = os.path.join(out_dir, f"coordinate_systems_trial{test_num} - Zero version.png")
-    plt.savefig(coords_path, dpi=220, bbox_inches="tight"); plt.show()
-    print(f"Saved coordinate systems plot: {coords_path}")
+    # 3D triads of Camera, Top, and Probe frames + path (like your OG plot)
+    # Choose a representative time index (middle of the sequence)
+    k = len(tt) // 2 if len(tt) > 0 else 0
 
-    # ---- Processing CSV: centered XY + transformed wrenches (object frame) ----
-    if ati_data is not None:
-        # Pair ATI samples to nearest external/object poses to compute object-frame wrenches at ATI times
-        ext_asof = pd.merge_asof(ati_data[["time"]].sort_values("time"),
-                                 external[["t","px","py","pz","R"]].rename(columns={"t":"t_ext"}),
-                                 left_on="time", right_on="t_ext", direction="nearest", tolerance=PAIR_TOL_S)
-        obj_asof = pd.merge_asof(ati_data[["time"]].sort_values("time"),
-                                 obj[["t","px","py","pz","R"]].rename(columns={"t":"t_obj"}),
-                                 left_on="time", right_on="t_obj", direction="nearest", tolerance=PAIR_TOL_S)
-        valid = ext_asof["t_ext"].notna() & obj_asof["t_obj"].notna()
-        if valid.any():
-            R_C_ext_ati = np.stack(ext_asof.loc[valid,"R"].to_numpy())
-            R_C_obj_ati = np.stack(obj_asof.loc[valid,"R"].to_numpy())
-            F_ati = ati_data.loc[valid,["Fx","Fy","Fz"]].to_numpy(float)
-            T_ati = ati_data.loc[valid,["Tx","Ty","Tz"]].to_numpy(float)
-            F_obj, T_obj = transform_wrench_to_object(F_ati, T_ati, R_C_ext_ati, R_C_obj_ati, R_ext_ATI, flip_force=FLIP_FORCE_SIGN)
-            ati_obj = ati_data.loc[valid].copy()
-            ati_obj[["Fx","Fy","Fz"]] = F_obj
-            ati_obj[["Tx","Ty","Tz"]] = T_obj
-        else:
-            ati_obj = ati_data.copy()
-            print("Warning: No valid pose pairing for ATI times; leaving forces in sensor frame.")
+    # Rotation camera->top (columns are camera axes expressed in Top)
+    R_T_C = np.transpose(R_C_T, (0, 2, 1))
 
-        # Keep your centered XY at the time base of tip points, then asof-merge onto ATI time
-        tip_data = pd.DataFrame({'time': tt, 'x_position': Xc, 'y_position': Yc}).sort_values('time')
-        processing_data = pd.merge_asof(
-            ati_obj.sort_values('time'),
-            tip_data,
-            on='time',
-            direction='nearest',
-            tolerance=PAIR_TOL_S
-        )[["time","x_position","y_position","Fx","Fy","Fz","Tx","Ty","Tz"]]
+    # Probe rotation in Top: R_T_P = R_T_C @ R_C_P
+    R_T_P = np.einsum('nij,njk->nik', R_T_C, R_C_P)
 
-        processing_path = os.path.join(processing_dir, f"processing_test_{test_num} - Zero version.csv")
-        processing_data.to_csv(processing_path, index=False)
-        print(f"\nSaved processing data: {processing_path}")
-        print("Processing file contains:")
-        print(f"- {len(processing_data)} synchronized samples")
-        print("- Columns: time, x_position, y_position, Fx, Fy, Fz, Tx, Ty, Tz")
+    # Origins of frames, expressed in Top coordinates (mm)
+    origin_top_mm   = np.array([0.0, 0.0, 0.0])
+    origin_cam_top  = apply_homogeneous_matrices(T_Top_C, np.array([0.0, 0.0, 0.0]))[k]
+    origin_cam_mm   = origin_cam_top * 1e3
+    origin_probe_top = apply_homogeneous_matrices(T_Top_C, pP_C)[k]
+    origin_probe_mm  = origin_probe_top * 1e3
+    # Box origin in Top (expressed in Top coords, mm)
+    origin_box_top = apply_homogeneous_matrices(T_Top_C, pB_C)[k]
+    origin_box_mm = origin_box_top * 1e3
+    # Tip origin in Top (we already have tip_in_top in Top coords)
+    origin_tip_top = tip_in_top[k]
+    origin_tip_mm = origin_tip_top * 1e3
+    # Rotation of Box in Top: R_T_B = R_T_C @ R_C_B
+    R_T_B = np.einsum('nij,njk->nik', R_T_C, R_C_B)
+
+    def draw_triad(ax, origin_mm, R_axes_in_top, scale_mm=15.0, label=''):
+        o = origin_mm.astype(float)
+        A = R_axes_in_top.astype(float) * scale_mm  # scale columns
+        # draw thicker arrows using quiver (with small arrow heads)
+        try:
+            ax.quiver(o[0], o[1], o[2], A[0,0], A[1,0], A[2,0], color='r', linewidth=2.5, arrow_length_ratio=0.12)
+            ax.quiver(o[0], o[1], o[2], A[0,1], A[1,1], A[2,1], color='g', linewidth=2.5, arrow_length_ratio=0.12)
+            ax.quiver(o[0], o[1], o[2], A[0,2], A[1,2], A[2,2], color='b', linewidth=2.5, arrow_length_ratio=0.12)
+        except Exception:
+            # fallback to simple lines if quiver not available
+            ax.plot([o[0], o[0]+A[0,0]],[o[1], o[1]+A[1,0]],[o[2], o[2]+A[2,0]], color='r', linewidth=2)
+            ax.plot([o[0], o[0]+A[0,1]],[o[1], o[1]+A[1,1]],[o[2], o[2]+A[2,1]], color='g', linewidth=2)
+            ax.plot([o[0], o[0]+A[0,2]],[o[1], o[1]+A[1,2]],[o[2], o[2]+A[2,2]], color='b', linewidth=2)
+
+        # origin marker and label
+        ax.scatter([o[0]], [o[1]], [o[2]], color='k', s=18)
+        if label:
+            ax.text(o[0], o[1], o[2], f" {label}", fontsize=10, fontweight='bold')
+        # small axis labels near the arrow tips for clarity
+        tip_offset = 0.06 * scale_mm
+        ax.text(o[0]+A[0,0]+tip_offset, o[1]+A[1,0], o[2]+A[2,0], 'X', color='r', fontsize=9)
+        ax.text(o[0]+A[0,1], o[1]+A[1,1]+tip_offset, o[2]+A[2,1], 'Y', color='g', fontsize=9)
+        ax.text(o[0]+A[0,2], o[1]+A[1,2], o[2]+A[2,2]+tip_offset, 'Z', color='b', fontsize=9)
+
+    fig_axes = plt.figure()
+    axf = fig_axes.add_subplot(111, projection='3d')
+    # Path in Top frame
+    axf.plot(Xmm, Ymm, Z_top*1e3, linewidth=1.0, alpha=0.8)
+    # Triads: Top (origin at top center), Camera, Probe (handle), Tip, and Box
+    draw_triad(axf, origin_top_mm, np.eye(3), scale_mm=18.0, label='Top')
+    draw_triad(axf, origin_cam_mm, R_T_C[k], scale_mm=18.0, label='Cam')
+    # Handle / probe frame
+    draw_triad(axf, origin_probe_mm, R_T_P[k], scale_mm=16.0, label='Handle')
+    # Tip frame (orient using probe axes; origin at tip)
+    draw_triad(axf, origin_tip_mm, R_T_P[k], scale_mm=12.0, label='Tip')
+    # Box frame
+    draw_triad(axf, origin_box_mm, R_T_B[k], scale_mm=20.0, label='Box')
+
+    axf.set_xlabel("Top X [mm]"); axf.set_ylabel("Top Y [mm]"); axf.set_zlabel("Top Z [mm]")
+    axf.set_title(f"Frames (Top/Cam/Probe) and tip path — trial {test_num}")
+    # ensure equal scaling and center view
+    set_axes_equal_3d(axf, Xmm, Ymm, Z_top*1e3, margin_mm=20.0)
+    # Create a simple legend using proxy artists
+    from matplotlib.lines import Line2D
+    legend_items = [Line2D([0], [0], color='r', lw=3), Line2D([0], [0], color='g', lw=3), Line2D([0], [0], color='b', lw=3)]
+    axf.legend(legend_items, ['X axis', 'Y axis', 'Z axis'], loc='upper right')
+    # increase tick label sizes for readability
+    try:
+        axf.xaxis.set_tick_params(labelsize=9)
+        axf.yaxis.set_tick_params(labelsize=9)
+        axf.zaxis.set_tick_params(labelsize=9)
+    except Exception:
+        pass
+
+    fig_axes_path = os.path.join(out_dir, f"frames_and_path_trial{test_num}.png")
+    plt.savefig(fig_axes_path, dpi=220, bbox_inches='tight')
+    plt.show()
+    print(f"Saved plot: {fig_axes_path}")
+
+    # --------------- Transform forces/torques into TOP frame ---------------
+    if ati_data is not None and len(ati_data) > 0:
+        # nearest-neighbor merge like before, but then rotate F/T into Top frame
+        # Use the same mask windowing as your original (optional); here we keep all
+        tip_data = pd.DataFrame({'time': tt, 'x_position': Xmm, 'y_position': Ymm})
+        ati_clean = ati_data.sort_values('time')
+        tip_data = tip_data.sort_values('time')
+        merged = pd.merge_asof(tip_data, ati_clean, on='time', direction='nearest', tolerance=PAIR_TOL_S)
+
+        # Precompute for speed
+        R_T_C_all = np.transpose(R_C_T, (0, 2, 1))  # camera→top
+
+        def nearest_index(t_query: float) -> int:
+            idx = np.searchsorted(tt, t_query)
+            if idx <= 0: return 0
+            if idx >= len(tt): return len(tt) - 1
+            # choose nearest between idx-1 and idx
+            return idx if (tt[idx] - t_query) < (t_query - tt[idx-1]) else idx-1
+
+        Fx_top = np.full(len(merged), np.nan)
+        Fy_top = np.full(len(merged), np.nan)
+        Fz_top = np.full(len(merged), np.nan)
+        Tx_top = np.full(len(merged), np.nan)
+        Ty_top = np.full(len(merged), np.nan)
+        Tz_top = np.full(len(merged), np.nan)
+
+        sign = -1.0 if FORCE_INTO_OBJECT else 1.0
+
+        for i, row in merged.iterrows():
+            if not np.isfinite(row.get('Fx', np.nan)):
+                continue
+            k = nearest_index(row['time'])
+            # ATI→marker
+            F_atim = R_ati_to_atimarker @ np.array([row['Fx'], row['Fy'], row['Fz']], float)
+            T_atim = R_ati_to_atimarker @ np.array([row['Tx'], row['Ty'], row['Tz']], float)
+            # marker (probe) → camera
+            F_cam = R_C_P[k] @ F_atim
+            T_cam = R_C_P[k] @ T_atim
+            # camera → top
+            F_top_vec = sign * (R_T_C_all[k] @ F_cam)
+            T_top_vec = R_T_C_all[k] @ T_cam
+            Fx_top[i], Fy_top[i], Fz_top[i] = F_top_vec
+            Tx_top[i], Ty_top[i], Tz_top[i] = T_top_vec
+
+        processing = merged.copy()
+        processing['Fx_top'] = Fx_top
+        processing['Fy_top'] = Fy_top
+        processing['Fz_top'] = Fz_top
+        processing['Tx_top'] = Tx_top
+        processing['Ty_top'] = Ty_top
+        processing['Tz_top'] = Tz_top
+
+        # Keep primary columns first
+        processing = processing[['time', 'x_position', 'y_position',
+                                 'Fx_top', 'Fy_top', 'Fz_top', 'Tx_top', 'Ty_top', 'Tz_top',
+                                 'Fx', 'Fy', 'Fz', 'Tx', 'Ty', 'Tz']]
+
+        processing_path = os.path.join(processing_dir, f"processing_test_{test_num}.csv")
+        processing.to_csv(processing_path, index=False)
+        print(f"Saved processing data: {processing_path}")
     else:
-        print("\nNo ATI data found - skipping processing file creation")
+        print("No ATI data found — skipping F/T processing CSV.")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Tip/contact path with object-frame wrenches (FullForce-style).")
-    parser.add_argument("--atracsys", type=str, default=None, help="Path to atracsys_trialXX.txt/.csv")
-    parser.add_argument("--test", type=int, default=test_num, help="Test number for output folder name")
-    parser.add_argument("--no_plane_flatten", action="store_true", help="Disable plane flattening")
-    parser.add_argument("--pivot_seconds", type=float, default=PIVOT_SECONDS, help="(Unused) kept for API compat")
+    parser = argparse.ArgumentParser(description="Tip path on box top (no flatten) + F/T to Top frame")
+    parser.add_argument("--atracsys", type=str, default=ATR_PATH, help="Path to atracsys_trialXX.txt/.csv")
+    parser.add_argument("--test", type=int, default=test_num, help="Test number (for output names)")
+    parser.add_argument("--pivot_seconds", type=float, default=PIVOT_SECONDS, help="Seconds used for pivot calibration window")
+    parser.add_argument("--force_into_object", action="store_true", help="Flip force to point into object (default off unless FORCE_INTO_OBJECT=True)")
     args = parser.parse_args()
 
-    if args.no_plane_flatten: PLANE_FLATTEN = False
-    PIVOT_SECONDS = args.pivot_seconds  # kept for CLI compatibility
+    if not os.path.exists(args.atracsys):
+        sys.exit(f"Atracsys file not found: {args.atracsys}")
 
-    atr_path = args.atracsys or (DATASET_DIRS[1] if len(DATASET_DIRS)>1 else None)
-    print(f"\nChecking paths:")
-    print(f"Directory to datasets: {directory_to_datasets}")
-    print(f"ATI data path: {DATASET_DIRS[0]}")
-    print(f"Atracsys path: {atr_path}")
+    # CLI toggles
+    PIVOT_SECONDS = args.pivot_seconds
+    if args.force_into_object:
+        FORCE_INTO_OBJECT = True
 
-    if not os.path.exists(directory_to_datasets):
-        sys.exit(f"Dataset directory not found: {directory_to_datasets}")
-    if not atr_path or not os.path.exists(atr_path):
-        sys.exit(f"Atracsys file not found: {atr_path}\nPlease check if the file exists or pass --atracsys with the correct path.")
-    main(atr_path, args.test)
+    print("\nPaths in use:")
+    print("  dataset dir:", directory_to_datasets)
+    print("  ATI path   :", ATI_PATH)
+    print("  Atracsys   :", args.atracsys)
+    print("  out_dir    :", out_dir)
+    print("  processing :", processing_dir)
+
+    main(args.atracsys, args.test)

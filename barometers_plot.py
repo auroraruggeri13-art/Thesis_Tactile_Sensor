@@ -14,8 +14,11 @@ import matplotlib.pyplot as plt
 # ============================================================
 # === USER SETTINGS ==========================================
 # ============================================================
-file_name = "datalog_2025-11-06_14-35-45.csv"
-CSV_PATH = os.path.join(r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\Sensor-Logs", file_name)
+file_name = "barometers_trial5101.txt"
+test_num = 4105
+version_num = 4
+directory_to_datasets = os.path.abspath(fr"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data\test {test_num} - sensor v{version_num}")
+CSV_PATH = os.path.join(directory_to_datasets, file_name)
 
 TITLE = "Barometer Pressures vs Time"
 UNITS = "hPa"        # hectopascals = millibars

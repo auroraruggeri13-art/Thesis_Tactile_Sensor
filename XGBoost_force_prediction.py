@@ -54,14 +54,15 @@ def calculate_grouped_rmse(y_true, y_pred):
 
 if __name__ == "__main__":
     # --- 1. Load and Preprocess Data ---
-    DATA_DIRECTORY = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\test data" 
+    DATA_DIRECTORY = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data" 
     CSV_FILENAMES = [
-        "test 101 - sensor v1\synchronized_events_101.csv" 
+        r"test 401 - sensor v4\synchronized_events_401.csv"
     ]
-    
+
+    output_targets = ['x', 'y','fx', 'fy', 'fz']  #, 'tx', 'ty', 'tz'
     all_dfs = []
     # Define the columns you expect to have in the final clean DataFrame
-    expected_cols = ['t', 'b1', 'b2', 'b3', 'b4', 'b5', 'b6', '-x (mm)', '-y (mm)', 'fx', 'fy', 'fz', 'tx', 'ty', 'tz']
+    expected_cols = ['t', 'b1', 'b2', 'b3', 'b4', 'b5', 'b6', 'x', 'y', 'fx', 'fy', 'fz', 'tx', 'ty', 'tz']
 
     for filename in CSV_FILENAMES:
         full_path = os.path.join(DATA_DIRECTORY, filename)
@@ -75,13 +76,6 @@ if __name__ == "__main__":
             
             # Clean column names
             temp_df.columns = temp_df.columns.str.strip()
-            
-            # Fix corrupted column names
-            if '#NOME?' in temp_df.columns and '#NOME?.1' in temp_df.columns:
-                temp_df = temp_df.rename(columns={
-                    '#NOME?': '-x (mm)',
-                    '#NOME?.1': '-y (mm)'
-                })
             
             # Verify all expected columns are present
             missing_cols = [col for col in expected_cols if col not in temp_df.columns]
@@ -102,11 +96,14 @@ if __name__ == "__main__":
     print(f"Successfully combined {len(all_dfs)} files with {len(df)} total data points.")
 
     INPUT_FEATURES = ['b1', 'b2', 'b3', 'b4', 'b5', 'b6']
-    OUTPUT_TARGETS = ['-x (mm)', '-y (mm)', 'fx', 'fy', 'fz']
+    OUTPUT_TARGETS = output_targets
     X = df[INPUT_FEATURES].values
     Y = df[OUTPUT_TARGETS].values
 
-    X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.2, random_state=42)
+    #X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.2, random_state=42)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, Y, test_size=0.2, random_state=42, shuffle=True
+    )
     x_scaler = StandardScaler()
     X_train_scaled = x_scaler.fit_transform(X_train)
     X_test_scaled = x_scaler.transform(X_test)
@@ -162,7 +159,7 @@ if __name__ == "__main__":
     
     # Plot all targets summary
     print("\nGenerating prediction plots...")
-    save_dir = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\Thesis - Tactile Sensor\models paramters\XGBoost"
+    save_dir = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\models paramters\XGBoost"
     plot_all_targets_summary(y_test, predictions, OUTPUT_TARGETS, save_dir=save_dir, version=version)
 
     print("\n" + "="*70 + "\nPER-TARGET PERFORMANCE METRICS\n" + "="*70)
@@ -177,7 +174,7 @@ if __name__ == "__main__":
     # Extract version number from the CSV filename
     version = CSV_FILENAMES[0].split("sensor ")[1].split("\\")[0]  # This will extract "v2" from the filename
     
-    save_dir = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\Thesis - Tactile Sensor\models paramters\XGBoost"
+    save_dir = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\models paramters\XGBoost"
     models_path = os.path.join(save_dir, f'specialized_xgb_models_{version}.pkl')
     scaler_path = os.path.join(save_dir, f'x_scaler_xgb_{version}.pkl')
     

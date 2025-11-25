@@ -277,12 +277,13 @@ if __name__ == "__main__":
     # --- 1. Load and Combine Data ---
     DATA_DIRECTORY = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data" 
     CSV_FILENAMES = [
-        "test 109 - sensor v1\synchronized_events_109.csv" 
+        r"test 4101 - sensor v4\synchronized_events_4101.csv"
     ]
 
+    output_targets = ['x', 'y','fx', 'fy', 'fz']  #, 'tx', 'ty', 'tz'
     all_dfs = []
     # Define the columns you expect to have in the final clean DataFrame
-    expected_cols = ['t', 'b1', 'b2', 'b3', 'b4', 'b5', 'b6', '-x (mm)', '-y (mm)', 'fx', 'fy', 'fz', 'tx', 'ty', 'tz']
+    expected_cols = ['t', 'b1', 'b2', 'b3', 'b4', 'b5', 'b6', 'x', 'y', 'fx', 'fy', 'fz', 'tx', 'ty', 'tz']
 
     for filename in CSV_FILENAMES:
         full_path = os.path.join(DATA_DIRECTORY, filename)
@@ -300,13 +301,6 @@ if __name__ == "__main__":
             # Print column names for debugging
             print(f"\nFile: {filename}")
             print("Columns found:", temp_df.columns.tolist())
-            
-            # Fix corrupted column names
-            if '#NOME?' in temp_df.columns and '#NOME?.1' in temp_df.columns:
-                temp_df = temp_df.rename(columns={
-                    '#NOME?': '-x (mm)',
-                    '#NOME?.1': '-y (mm)'
-                })
             
             # Verify all expected columns are present
             missing_cols = [col for col in expected_cols if col not in temp_df.columns]
@@ -336,7 +330,7 @@ if __name__ == "__main__":
     print(df)
  
     INPUT_FEATURES = ['b1', 'b2', 'b3', 'b4', 'b5', 'b6']
-    OUTPUT_TARGETS = ['-x (mm)', '-y (mm)', 'fx', 'fy', 'fz']
+    OUTPUT_TARGETS = output_targets
 
     X = df[INPUT_FEATURES].values
     Y = df[OUTPUT_TARGETS].values
@@ -346,11 +340,10 @@ if __name__ == "__main__":
     print("SPLITTING DATA INTO TRAIN / VALIDATION / TEST")
     print("="*70)
     
-    # First split: separate test set (10%)
-    X_temp, X_test, y_temp, y_test = train_test_split(X, Y, test_size=0.20, random_state=42)
-    
-    # Second split: split remaining 90% into train (80%) and validation (20%)
-    X_train, X_val, y_train, y_val = train_test_split(X_temp, y_temp, test_size=0.4, random_state=42)
+    # doing temporal split: train firts 80%, val next 10%, test last 10%
+    X_train, X_temp, y_train, y_temp = train_test_split(X, Y, test_size=0.40, shuffle=False)
+    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.30, shuffle=False)
+
     
     print(f"Training set:   {len(X_train)} samples ({len(X_train)/len(X)*100:.1f}%)")
     print(f"Validation set: {len(X_val)} samples ({len(X_val)/len(X)*100:.1f}%)")
@@ -400,7 +393,7 @@ if __name__ == "__main__":
     #print(model)
 
     # Train using VALIDATION set (not test set!)
-    model.learn(train_loader, val_loader, num_epochs=500, y_scaler=y_scaler, early_stopping_patience=50)
+    model.learn(train_loader, val_loader, num_epochs=500, y_scaler=y_scaler, early_stopping_patience=100)
 
     # --- 5. Evaluate on TEST SET (never seen during training) ---
     print("\n" + "="*70)
@@ -462,7 +455,7 @@ if __name__ == "__main__":
         print(f"{target:12s} | MAE: {test_mae:8.4f} | RMSE: {test_rmse:8.4f} | R²: {test_r2:7.4f}")
     
     # Define save directory for plots
-    save_dir = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\Thesis - Tactile Sensor\models paramters\NN"
+    save_dir = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\models parameters\NN"
     
     # Extract version number from the CSV filename (for plots)
     version = CSV_FILENAMES[0].split("sensor ")[1].split("\\")[0]
@@ -501,7 +494,7 @@ if __name__ == "__main__":
     version = CSV_FILENAMES[0].split("sensor ")[1].split("\\")[0]  # This will extract "v2" from the filename
     
     # Define save directory
-    save_dir = r"C:\Users\aurir\OneDrive\Desktop\Thesis- Biorobotics Lab\Thesis - Tactile Sensor\models paramters\NN"
+    save_dir = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\models parameters\NN"
     
     # Save model and scalers with version
     model_path = os.path.join(save_dir, f'improved_regression_model_{version}.pth')

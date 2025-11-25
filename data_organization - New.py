@@ -1,460 +1,409 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Add barometer channels to an already-synchronized CSV (time + x,y + Fx..Tz),
-then export the merged CSV (original destination) and a copy to a new folder.
-Plots: same outputs & filenames as the previous script.
+Barometer–force synchronization with manual time shift + masking only.
+
+Steps:
+1) Load processing_test CSV (epoch seconds in 'time', positions, forces)
+2) Load barometer CSV (uses 'Epoch_s' if present)
+3) Apply manual barometer time shift (seconds)
+4) Synchronize with merge_asof (nearest, tolerance)
+5) Apply spatial mask (keep only rows within bounds)
+6) Save synchronized CSV
 
 Author: Aurora Ruggeri
 """
 
 import os
 import re
-from typing import List
 import numpy as np
 import pandas as pd
-from datetime import datetime
+from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
-from pathlib import Path
 
-# =========================
-# ======  CONFIG  =========
-# =========================
-from pathlib import Path
+# =========================== CONFIGURATION ===========================
 
-test_num = 109
-version_num = 1
+TEST_NUM = 4105
+VERSION_NUM = 4
 
-# --- Input paths ---
-# 1) Precombined CSV that already contains time + x,y + Fx..Tz
-COMBINED_DIR = Path(r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data") / f"test {test_num} - sensor v{version_num}"
-COMBINED_FILE = f"processing_test_{test_num}.csv"
+BASE_DIR = Path(r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data")
+DATA_DIR = BASE_DIR / f"test {TEST_NUM} - sensor v{VERSION_NUM}"
 
-# 2) Barometer CSV: automatically find csv file that starts with 'datalog_'
-BARO_DIR = Path(r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data") / f"test {test_num} - sensor v{version_num}"
-baro_files = list(BARO_DIR.glob("datalog_*.csv"))
-if not baro_files:
-    raise FileNotFoundError(f"No 'datalog_*.csv' found in: {BARO_DIR}")
-BARO_FILENAME = baro_files[0].name
+# Input files
+PROCESSING_FILE = DATA_DIR / f"processing_test_{TEST_NUM}.csv"
+BAROMETER_FILE  = None  # if None, picks most recent datalog_*.csv in DATA_DIR
 
-# --- Original output (keep as-is: same folder + same plot names) ---
-OUTPUT_DIR  = Path(r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data") / f"test {test_num} - sensor v{version_num}"
-OUTPUT_NAME = f"synchronized_events_{test_num}.csv"
+# Output
+OUTPUT_FILE = DATA_DIR / f"synchronized_events_{TEST_NUM}.csv"
+save_plots_dir = DATA_DIR / "plots synchronized"
+save_plots_dir.mkdir(exist_ok=True, parents=True)
 
-# --- Path plot rectangle crop (mm), same as before ---
-PATH_RECT_WIDTH_MM  = 45.0
-PATH_RECT_HEIGHT_MM = 20.0
-PATH_RECT_CENTER_X_MM = 0.0
-PATH_RECT_CENTER_Y_MM = 0.0
+# --- Synchronization params (same style as your short script) ---
+ASOF_DIRECTION   = "nearest"
+ASOF_TOLERANCE_S = 0.05   # seconds
 
-# =========================
-# ======  READERS  ========
-# =========================
+# --- Manual time shift (APPLIED TO BAROMETER 't') ---
+# Positive -> shift barometer FORWARD in time; Negative -> backward
+BARO_TIME_SHIFT_S = 0.00000234
 
-def read_barometer_csv(path: str) -> pd.DataFrame:
-    """
-    Read Arduino/MCU barometer CSV: 'Timestamp' plus 6 channels (e.g. 'barometer 1'..'barometer 6').
-    The date is taken from the filename 'datalog_YYYY-MM-DD_HH-MM-SS.csv'.
-    Returns DF indexed by epoch ns ('time_ns', UTC), columns: b1..b6 (hPa).
-    """
-    LOCAL_TZ = 'America/New_York'
+# --- Spatial masking (keep this) ---
+SPATIAL_FILTER = {
+    'x_range': (-20, 20),  # mm
+    'y_range': (-8, 8),    # mm
+    'z_range': (-1.0, 1.0) # mm
+}
 
-    df = pd.read_csv(path, low_memory=False)
+# =============================== HELPERS ===============================
+
+def ensure_seconds(series: pd.Series) -> pd.Series:
+    """Coerce a time-like numeric column to seconds."""
+    s = pd.to_numeric(series, errors='coerce')
+    med = s.dropna().abs().median()
+    if med > 1e12:   s *= 1e-9  # ns
+    elif med > 1e9:  s *= 1e-6  # us
+    elif med > 1e6:  s *= 1e-3  # ms
+    return s
+
+def find_barometer_file(directory: Path) -> Path:
+    """Pick most-recent datalog_*.csv if BAROMETER_FILE is not set."""
+    candidates = list(directory.glob("datalog_*.csv"))
+    if not candidates:
+        raise FileNotFoundError(f"No 'datalog_*.csv' in {directory}")
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+# =============================== LOADERS ===============================
+
+def load_processing_data(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    required = ['time', 'x_position_mm', 'y_position_mm', 'z_position_mm']
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns in processing CSV: {missing}")
+
+    # forces (upper/lower accepted)
+    force_names = ['Fx','Fy','Fz','Tx','Ty','Tz']
+    present_forces = []
+    for c in force_names:
+        if c in df.columns:
+            present_forces.append(c)
+        elif c.lower() in df.columns:
+            present_forces.append(c.lower())
+    if not present_forces:
+        raise ValueError("No force/torque columns found (Fx/Fy/Fz/Tx/Ty/Tz).")
+
+    df['time'] = ensure_seconds(df['time'])
+    keep = ['time','x_position_mm','y_position_mm','z_position_mm'] + present_forces
+    return df[keep].sort_values('time', ignore_index=True)
+
+def load_barometer_data(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
     df.columns = [c.strip() for c in df.columns]
 
-    ts_col = next((c for c in df.columns if c.lower().startswith('timestamp')), None)
-    if ts_col is None:
-        raise ValueError("Barometer CSV must have a 'Timestamp' column (HH:MM:SS.sss).")
+    if 'Epoch_s' in df.columns:
+        t = ensure_seconds(pd.to_numeric(df['Epoch_s'], errors='coerce'))
+    else:
+        # Fallback: parse from filename date + 'Timestamp' column (legacy format)
+        ts_col = next((c for c in df.columns if 'timestamp' in c.lower()), None)
+        if ts_col is None:
+            raise ValueError("Barometer CSV needs 'Epoch_s' or a 'Timestamp' column.")
+        m = re.search(r'datalog_(\d{4}-\d{2}-\d{2})', os.path.basename(str(path)))
+        if not m:
+            raise ValueError("Filename must look like 'datalog_YYYY-MM-DD_...csv' for legacy mode.")
+        date_str = m.group(1)
+        dt_strings = date_str + ' ' + df[ts_col].astype(str)
+        dt = pd.to_datetime(dt_strings, format='%Y-%m-%d %H:%M:%S.%f', errors='coerce', utc=True)
+        t = dt.view('int64') / 1e9  # seconds
 
-    m = re.search(r'datalog_(\d{4}-\d{2}-\d{2})_\d{2}-\d{2}-\d{2}', os.path.basename(path))
-    if not m:
-        raise ValueError("Filename must contain date like 'datalog_YYYY-MM-DD_hh-mm-ss.csv'")
-    date_str = m.group(1)
+    # barometer columns
+    baro_cols = [f'barometer {i}' for i in range(1,7) if f'barometer {i}' in df.columns]
+    if len(baro_cols) != 6:
+        raise ValueError(f"Expected 6 barometer columns, found {len(baro_cols)}: {baro_cols}")
 
-    dt_local = pd.to_datetime(
-        date_str + ' ' + df[ts_col].astype(str),
-        format='%Y-%m-%d %H:%M:%S.%f',
-        errors='coerce'
-    ).dt.tz_localize(LOCAL_TZ, nonexistent='NaT', ambiguous='NaT')
-    dt_utc = dt_local.dt.tz_convert('UTC')
+    out = pd.DataFrame({'time': t})
+    for i, c in enumerate(baro_cols, start=1):
+        out[f'b{i}'] = pd.to_numeric(df[c], errors='coerce')
 
-    df = df.loc[~dt_utc.isna()].copy()
-    df['time_ns'] = dt_utc.astype(np.int64)
-    df = df.drop_duplicates(subset=['time_ns']).sort_values('time_ns')
+    # apply manual shift (same logic as your short script)
+    out['time'] = out['time'] + BARO_TIME_SHIFT_S
 
-    # Map pressure columns to b1..b6
-    bcols = []
-    for i in range(1,7):
-        if f'barometer {i}' in df.columns: bcols.append(f'barometer {i}')
-        elif f'b{i}' in df.columns:        bcols.append(f'b{i}')
-    if len(bcols) != 6:
-        cand = [c for c in df.columns if 'baro' in c.lower()]
-        if len(cand) >= 6: bcols = cand[:6]
-        else: raise ValueError(f"Could not find 6 barometer columns, found: {bcols or cand}")
+    return out.dropna(subset=['time']).sort_values('time', ignore_index=True)
 
-    out = df.set_index('time_ns')[[*bcols]].copy()
-    out.index.name = 'time_ns'
-    out.columns = [f"b{i}" for i in range(1,7)]
-    for c in out.columns:
-        out[c] = pd.to_numeric(out[c], errors='coerce')
-    return out
+# =========================== CORE OPERATIONS ===========================
 
-# =========================
-# ======  PLOTTING  =======
-# =========================
+def synchronize_data(proc_df: pd.DataFrame, baro_df: pd.DataFrame) -> pd.DataFrame:
+    """Nearest-neighbor time merge with tolerance (epoch seconds)."""
+    merged = pd.merge_asof(
+        proc_df.sort_values('time'),
+        baro_df.sort_values('time'),
+        on='time',
+        direction=ASOF_DIRECTION,
+        tolerance=ASOF_TOLERANCE_S
+    )
+    # keep only rows where barometers matched
+    merged = merged.dropna(subset=['b1','b2','b3','b4','b5','b6'])
+    return merged
 
-def plot_barometers(df: pd.DataFrame, out_dir: str, filename: str = "plot_barometers.png"):
+def apply_spatial_filter(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep only rows in the specified spatial bounds."""
+    if SPATIAL_FILTER is None:
+        return df
+
+    x_min, x_max = SPATIAL_FILTER['x_range']
+    y_min, y_max = SPATIAL_FILTER['y_range']
+    z_min, z_max = SPATIAL_FILTER['z_range']
+
+    mask = (
+        df['x_position_mm'].between(x_min, x_max) &
+        df['y_position_mm'].between(y_min, y_max) &
+        df['z_position_mm'].between(z_min, z_max)
+    )
+    return df.loc[mask].copy()
+
+def zero_barometers(df, baseline_duration=1.0):
+    """
+    Subtract the mean of the first `baseline_duration` seconds from each barometer.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain 'time' and barometer columns (b1..b6 or barometer 1..6).
+    baseline_duration : float
+        Duration in seconds from the start used to compute the baseline mean.
+
+    Returns
+    -------
+    df_zeroed : pd.DataFrame
+        Copy of df with barometer data baseline-corrected.
+    """
+    df = df.copy()
+    t0 = df["time"].min()
+    mask = df["time"] <= t0 + baseline_duration
+
+    # Find barometer columns automatically
+    baro_cols = [c for c in df.columns if c.lower().startswith("b") or "barometer" in c.lower()]
+    if not baro_cols:
+        print("No barometer columns found.")
+        return df
+
+    for c in baro_cols:
+        baseline = df.loc[mask, c].mean()
+        df[c] = df[c] - baseline
+        print(f"{c}: baseline {baseline:.2f} hPa subtracted")
+
+    return df
+
+# ==============================PLOTTING FUNCTIONS=======================
+
+def _force_name(df, base):
+    return base if base in df.columns else base.lower() if base.lower() in df.columns else None
+
+def plot_barometers_subplots(df, save_path=None, suptitle="Barometers"):
     fig, axes = plt.subplots(3, 2, figsize=(12, 10), sharex=True)
     axes = axes.flatten()
     for i in range(6):
-        ax = axes[i]
         col = f"b{i+1}"
-        if col in df.columns:
-            mask = df['t'].notna() & df[col].notna()
-            if mask.any():
-                ax.plot(df.loc[mask, 't'].values, df.loc[mask, col].values, linewidth=1.0)
-                ax.set_ylabel(col + " (hPa)")
-        ax.grid(True, alpha=0.3)
-    fig.suptitle("Barometer pressures vs time")
-    axes[-1].set_xlabel("t (s)")
-    fig.tight_layout()
-    p = Path(out_dir) / filename
-    fig.savefig(p, dpi=150)
-    plt.close(fig)
-    print(f"Saved {p}")
+        if col not in df.columns: continue
+        axes[i].plot(df["time"], df[col], linewidth=1.2)
+        axes[i].set_ylabel(f"{col} [hPa]")
+        axes[i].grid(alpha=0.3)
+    axes[-1].set_xlabel("Time [s]")
+    fig.suptitle(suptitle)
+    fig.tight_layout(rect=[0,0,1,0.97])
+    if save_path:
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    return fig
 
-def plot_wrench(df: pd.DataFrame, out_dir: str, filename: str = "plot_wrench.png"):
-    force_cols = ['fx', 'fy', 'fz', 'tx', 'ty', 'tz']
-    labels = ["Fx (N)", "Fy (N)", "Fz (N)", "Tx (N⋅m)", "Ty (N⋅m)", "Tz (N⋅m)"]
+def plot_forces_torques_subplots(df, save_path=None, suptitle="ATI Force/Torque"):
+    cols = []
+    for base in ["Fx","Fy","Fz","Tx","Ty","Tz"]:
+        c = _force_name(df, base)
+        if c: cols.append((c, f"{base}"))
+    if not cols:
+        print("No ATI columns found."); return None
+
     fig, axes = plt.subplots(3, 2, figsize=(12, 10), sharex=True)
     axes = axes.flatten()
-    for i, col in enumerate(force_cols):
-        ax = axes[i]
-        if col in df.columns:
-            mask = df['t'].notna() & df[col].notna()
-            if mask.any():
-                ax.plot(df.loc[mask, 't'].values, df.loc[mask, col].values, linewidth=1.0)
-                ax.set_ylabel(labels[i])
-        ax.grid(True, alpha=0.3)
-    fig.suptitle("Force/Torque vs time")
-    axes[-1].set_xlabel("t (s)")
-    fig.tight_layout()
-    p = Path(out_dir) / filename
-    fig.savefig(p, dpi=150)
-    plt.close(fig)
-    print(f"Saved {p}")
+    for ax, (c, label) in zip(axes, cols):
+        ax.plot(df["time"], df[c], linewidth=1.2)
+        unit = "N" if label.startswith("F") else "N·m"
+        ax.set_ylabel(f"{label} [{unit}]")
+        ax.grid(alpha=0.3)
+    axes[min(len(cols),6)-1].set_xlabel("Time [s]")
+    fig.suptitle(suptitle)
+    fig.tight_layout(rect=[0,0,1,0.97])
+    if save_path:
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    return fig
 
-def plot_b1_and_fz(df: pd.DataFrame, out_dir: str, filename: str = "plot_b1_vs_fz.png"):
-    fig, ax1 = plt.subplots(figsize=(12, 4))
-    if 'b1' in df.columns:
-        mask1 = df['t'].notna() & df['b1'].notna()
-        if mask1.any():
-            ax1.plot(df.loc[mask1, 't'].values, df.loc[mask1, 'b1'].values, linewidth=1.0, label='b1 (hPa)')
-    ax1.set_xlabel("t (s)")
-    ax1.set_ylabel("b1 (hPa)")
-    ax1.grid(True, alpha=0.3)
+def plot_barometers_vs_force(df, force_col="Fz", save_path=None, suptitle=None):
+    fcol = _force_name(df, force_col)
+    if not fcol:
+        print(f"No force column matching {force_col} found."); return None
 
-    ax2 = ax1.twinx()
-    if 'fz' in df.columns:
-        mask2 = df['t'].notna() & df['fz'].notna()
-        if mask2.any():
-            ax2.plot(df.loc[mask2, 't'].values, df.loc[mask2, 'fz'].values, linewidth=2.0, linestyle='-', label='fz (N)')
-    ax2.set_ylabel("fz (N)")
+    fig, axes = plt.subplots(3, 2, figsize=(14, 10), sharex=True)
+    axes = axes.flatten()
+    for i in range(6):
+        ax1 = axes[i]
+        bcol = f"b{i+1}"
+        if bcol not in df.columns: continue
+        # left: barometer
+        line1 = ax1.plot(df["time"], df[bcol], label=bcol, linewidth=1.2)
+        ax1.set_ylabel(f"{bcol} [hPa]")
+        ax1.grid(alpha=0.3)
+        # right: force (scaled via twin axis)
+        ax2 = ax1.twinx()
+        line2 = ax2.plot(df["time"], df[fcol], linestyle="--", alpha=0.8, label=fcol, linewidth=1.2, color="C3")
+        unit = "N" if fcol.lower().startswith("f") else "N·m"
+        ax2.set_ylabel(f"{fcol} [{unit}]")
+        # combined legend
+        lines = line1 + line2
+        labels = [l.get_label() for l in lines]
+        ax1.legend(lines, labels, loc="upper left", fontsize=8)
+    axes[-1].set_xlabel("Time [s]")
+    fig.suptitle(suptitle or f"Barometers vs {force_col}")
+    fig.tight_layout(rect=[0,0,1,0.97])
+    if save_path:
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    return fig
 
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
+def plot_barometers_vs_fz(df, save_path=None):
+    return plot_barometers_vs_force(df, "Fz", save_path, suptitle="Barometers vs Fz")
 
-    ax1.set_title("Barometer 1 vs Fz")
-    fig.tight_layout()
-    p = Path(out_dir) / filename
-    fig.savefig(p, dpi=150)
-    plt.close(fig)
-    print(f"Saved {p}")
+def plot_barometers_vs_fx(df, save_path=None):
+    return plot_barometers_vs_force(df, "Fx", save_path, suptitle="Barometers vs Fx")
 
-def plot_distributions(df: pd.DataFrame, out_dir: str):
-    """
-    Plot distribution histograms for each variable and save them in a distributions folder.
-    """
+def plot_barometers_vs_fy(df, save_path=None):
+    return plot_barometers_vs_force(df, "Fy", save_path, suptitle="Barometers vs Fy")
+
+def plot_path_xy_filtered(out_dir: str,
+                          X_mm: np.ndarray, Y_mm: np.ndarray, t_s: np.ndarray,
+                          test_num: int,
+                          break_on_time_gaps: bool = True,  gap_factor_time: float = 5.0,
+                          break_on_xy_jumps: bool = True,  jump_factor: float = 5.0,
+                          rect_size_mm=(40.0, 16.0),
+                          xlim=(-25, 25), ylim=(-10, 10)):
+
+    plt.figure(figsize=(8, 6))
+
+    n = len(X_mm)
+    breaks = []
+
+    if break_on_time_gaps and n > 1:
+        dt = np.diff(t_s)
+        med_dt = np.median(dt[dt > 0]) if np.any(dt > 0) else 0.0
+        if med_dt > 0:
+            b = np.where(dt > gap_factor_time * med_dt)[0]
+            breaks.extend(b.tolist())
+
+    if break_on_xy_jumps and n > 1:
+        steps = np.hypot(np.diff(X_mm), np.diff(Y_mm))
+        med_step = np.median(steps[steps > 0]) if np.any(steps > 0) else 0.0
+        if med_step > 0:
+            b = np.where(steps > jump_factor * med_step)[0]
+            breaks.extend(b.tolist())
+
+    breaks = sorted(set(breaks))
+
+    # Build arrays with NaNs inserted after each break
+    if breaks:
+        xs, ys = [X_mm[0]], [Y_mm[0]]
+        for i in range(n - 1):
+            xs.append(X_mm[i+1]); ys.append(Y_mm[i+1])
+            if i in breaks:
+                xs.append(np.nan); ys.append(np.nan)
+        x_plot = np.array(xs); y_plot = np.array(ys)
+    else:
+        x_plot, y_plot = X_mm, Y_mm
+
+    plt.plot(x_plot, y_plot, linewidth=1.2)
+
+    # Sensor rectangle (centered)
     try:
-        # Create distributions folder if it doesn't exist
-        dist_dir = os.path.join(out_dir, 'distributions')
-        os.makedirs(dist_dir, exist_ok=True)
-        
-        # Variables to plot
-        barometer_cols = [f'b{i}' for i in range(1,7)]
-        force_cols = ['fx', 'fy', 'fz', 'tx', 'ty', 'tz']
-        position_cols = ['-x (mm)', '-y (mm)']
-    
-            # Plot barometers distributions
-        if any(col in df.columns for col in barometer_cols):
-            plt.figure(figsize=(15, 10))
-            for i, col in enumerate(barometer_cols, 1):
-                if col in df.columns and not df[col].isna().all():
-                    plt.subplot(2, 3, i)
-                    df[col].dropna().hist(bins=50, density=True)
-                    plt.title(f'{col} Distribution')
-                    plt.xlabel('Pressure (hPa)')
-                    plt.ylabel('Density')
-                    plt.grid(True, alpha=0.3)
-            plt.tight_layout()
-            plt.savefig(os.path.join(dist_dir, f'barometers_distribution_{test_num}.png'))
-            plt.close()
-            print("Saved barometers distribution plot")
-        
-        # Plot force/torque distributions
-        if any(col in df.columns for col in force_cols):
-            plt.figure(figsize=(15, 10))
-            for i, col in enumerate(force_cols, 1):
-                if col in df.columns and not df[col].isna().all():
-                    plt.subplot(2, 3, i)
-                    df[col].dropna().hist(bins=50, density=True)
-                    plt.title(f'{col} Distribution')
-                    plt.xlabel('Force (N)' if col in ['fx', 'fy', 'fz'] else 'Torque (N⋅m)')
-                    plt.ylabel('Density')
-                    plt.grid(True, alpha=0.3)
-            plt.tight_layout()
-            plt.savefig(os.path.join(dist_dir, f'forces_distribution_{test_num}.png'))
-            plt.close()
-            print("Saved forces distribution plot")
-        
-        # Plot position distributions
-        if any(col in df.columns for col in position_cols):
-            plt.figure(figsize=(10, 5))
-            for i, col in enumerate(position_cols, 1):
-                if col in df.columns and not df[col].isna().all():
-                    plt.subplot(1, 2, i)
-                    df[col].dropna().hist(bins=50, density=True)
-                    plt.title(f'{col} Distribution')
-                    plt.xlabel('Position (mm)')
-                    plt.ylabel('Density')
-                    plt.grid(True, alpha=0.3)
-            plt.tight_layout()
-            plt.savefig(os.path.join(dist_dir, f'positions_distribution_{test_num}.png'))
-            plt.close()
-            print("Saved positions distribution plot")
-        
-        print(f"\nAll distribution plots saved in: {dist_dir}")
-        
-    except Exception as e:
-        print(f"Error generating distribution plots: {str(e)}")
-        # Make sure to close any open figures in case of error
-        plt.close('all')
+        ax = plt.gca()
+        rw, rh = rect_size_mm
+        rect = Rectangle((-rw/2, -rh/2), rw, rh, fill=False,
+                         edgecolor='k', linewidth=1.0, linestyle='--', alpha=0.9)
+        ax.add_patch(rect)
+    except Exception:
+        pass
 
-def plot_path(df: pd.DataFrame, out_dir: str, filename: str = "plot_path.png"):
-    """
-    Plot the path using -x (mm) and -y (mm) columns
-    """
-    xcol = '-x (mm)'
-    ycol = '-y (mm)'
-    
-    if xcol not in df.columns or ycol not in df.columns:
-        print("Skipping path plot (missing -x (mm) or -y (mm) columns).")
-        return
+    plt.grid(True, alpha=0.3)
+    plt.axis("equal")
+    plt.xlim(*xlim); plt.ylim(*ylim)
+    plt.xlabel("Top X [mm]"); plt.ylabel("Top Y [mm]")
+    plt.title(f"Tip path on top surface — trial {test_num}")
 
-    x_vals_mm = df[xcol].values
-    y_vals_mm = df[ycol].values
-    xlabel = xcol
-    ylabel = ycol
+    out_path = os.path.join(out_dir, f"tip_path_top_xy_trial{test_num}.png")
+    plt.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.show()
+    print(f"Saved plot: {out_path}")
 
-    mask = np.isfinite(x_vals_mm) & np.isfinite(y_vals_mm)
-    if not mask.any():
-        print("Skipping path plot (x/y all NaN).")
-        return
-
-    cx_center = PATH_RECT_CENTER_X_MM
-    cy_center = PATH_RECT_CENTER_Y_MM
-    half_w = PATH_RECT_WIDTH_MM / 2.0
-    half_h = PATH_RECT_HEIGHT_MM / 2.0
-    inside = (x_vals_mm >= (cx_center - half_w)) & (x_vals_mm <= (cx_center + half_w)) \
-           & (y_vals_mm >= (cy_center - half_h)) & (y_vals_mm <= (cy_center + half_h))
-    if not inside.any():
-        print("Skipping path plot (no points inside rectangle).")
-        return
-
-    fig, ax = plt.subplots(figsize=(6, 6))
-    ax.plot(x_vals_mm[inside], y_vals_mm[inside], linewidth=1.5)
-    rect = Rectangle((cx_center-half_w, cy_center-half_h),
-                     PATH_RECT_WIDTH_MM, PATH_RECT_HEIGHT_MM,
-                     edgecolor='black', facecolor='none', linestyle='--')
-    ax.add_patch(rect)
-    ax.plot(x_vals_mm[inside][0],  y_vals_mm[inside][0],  marker='o', color='green', label='start')
-    ax.plot(x_vals_mm[inside][-1], y_vals_mm[inside][-1], marker='o', color='red',   label='end')
-
-    ax.set_xlim(cx_center-half_w, cx_center+half_w)
-    ax.set_ylim(cy_center-half_h, cy_center+half_h)
-    ax.set_aspect('equal', adjustable='box')
-    ax.legend()
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.set_title('Contact XY path')
-    ax.grid(True, alpha=0.3)
-    p = Path(out_dir) / filename
-    fig.tight_layout()
-    fig.savefig(p, dpi=150)
-    plt.close(fig)
-    print(f"Saved {p}")
-
-# =========================
-# ======  CORE  ===========
-# =========================
+# ================================ MAIN =================================
 
 def main():
-    combined_path = os.path.join(COMBINED_DIR, COMBINED_FILE)
-    baro_path     = os.path.join(BARO_DIR, BARO_FILENAME)
+    print("#"*60)
+    print(f"# BARO–FORCE SYNC | Test {TEST_NUM} v{VERSION_NUM}")
+    print("#"*60)
+    print(f"- Baro manual time shift: {BARO_TIME_SHIFT_S:+.6f} s")
+    print(f"- merge_asof: direction={ASOF_DIRECTION}, tolerance={ASOF_TOLERANCE_S}s")
 
-    # --- Read combined CSV (already synchronized positions & wrench) ---
-    comb = pd.read_csv(combined_path)
-    comb.columns = [c.strip() for c in comb.columns]
+    if not PROCESSING_FILE.exists():
+        raise FileNotFoundError(PROCESSING_FILE)
+
+    baro_path = BAROMETER_FILE if BAROMETER_FILE else find_barometer_file(DATA_DIR)
+    if not Path(baro_path).exists():
+        raise FileNotFoundError(baro_path)
+
+    proc_df = load_processing_data(PROCESSING_FILE)
+    baro_df = load_barometer_data(baro_path)
+
+    merged = synchronize_data(proc_df, baro_df)
     
-    # Print the first timestamp in YYYY-MM-DD-HH-MM-SS format from processing file (Boston time)
-    if 'time' in comb.columns and len(comb) > 0:
-        first_time = pd.to_datetime(comb['time'].iloc[0], unit='s', utc=True)
-        boston_time = first_time.tz_convert('America/New_York')
-        formatted_time = boston_time.strftime('%Y-%m-%d-%H-%M-%S')
-        print(f"First timestamp in processing_test_{test_num}.csv: {formatted_time}")
-
-    # sanity checks (unchanged)
-    force_cols = {'time': 'time', 'x_position': 'x_position', 'y_position': 'y_position'}
-    wrench_cols = [('Fx', 'fx'), ('Fy', 'fy'), ('Fz', 'fz'), ('Tx', 'tx'), ('Ty', 'ty'), ('Tz', 'tz')]
-    missing = []
-    for req, _ in force_cols.items():
-        if req not in comb.columns:
-            missing.append(req)
-    for upper, lower in wrench_cols:
-        if upper not in comb.columns and lower not in comb.columns:
-            missing.append(f"{upper} or {lower}")
-    if missing:
-        raise ValueError(f"Combined CSV missing required columns: {missing}")
-
-    # 'time' -> epoch ns index
-    time_ns = (pd.to_numeric(comb['time'], errors='coerce') * 1e9).astype('int64')
-    comb = comb.assign(time_ns=time_ns).set_index('time_ns').sort_index()
-
-    # --- Read barometers (epoch ns index, b1..b6) ---
-    baro = read_barometer_csv(baro_path)
-    if baro.empty or comb.empty:
-        raise ValueError("One of the streams is empty; cannot compute overlap.")
-
-    # --- Compute strict overlap window in epoch ns ---
-    t_start = max(int(comb.index.min()), int(baro.index.min()))
-    t_end   = min(int(comb.index.max()), int(baro.index.max()))
+    # Zero the barometer data before plotting
+    merged = zero_barometers(merged, baseline_duration=0.000002)
     
-    # Calculate and print overlap information
-    overlap_duration = (t_end - t_start) / 1e9  # Convert nanoseconds to seconds
-    if t_end <= t_start:
-        print("No temporal overlap between processing and barometer data")
-        raise ValueError(
-            "No temporal overlap between combined and barometer data.\n"
-            f"combined: [{int(comb.index.min())}, {int(comb.index.max())}], "
-            f"baro: [{int(baro.index.min())}, {int(baro.index.max())}]"
-        )
-    else:
-        print(f"Found overlap between processing and barometer data: {overlap_duration:.2f} seconds")
-        # Convert start time to HH-MM-SS in Boston time
-        start_time = pd.to_datetime(t_start, unit='ns', utc=True).tz_convert('America/New_York')
-        end_time = pd.to_datetime(t_end, unit='ns', utc=True).tz_convert('America/New_York')
-        start_time_str = start_time.strftime('%H-%M-%S')
-        end_time_str = end_time.strftime('%H-%M-%S')
-        print(f"Overlap period: {start_time_str} to {end_time_str}")
+    df = merged  # or pd.read_csv("synchronized_events_4105.csv")
 
-    # Restrict both streams to the overlap; this guarantees all saved rows overlap
-    comb = comb.loc[t_start:t_end].copy()
-    baro_seg = baro.loc[t_start:t_end].copy()
+    plot_barometers_subplots(df, save_path=save_plots_dir / "barometers_subplots.png")
+    plot_forces_torques_subplots(df, save_path=save_plots_dir / "ati_forces_torques.png")
 
-    # --- Interpolate barometers onto (overlap-restricted) combined timeline ---
-    ti = comb.index.values.astype(np.int64)
-    out = pd.DataFrame(index=comb.index)
-    si = baro_seg.index.values.astype(np.int64)
-    for i in range(1, 7):
-        col = f"b{i}"
-        out[col] = np.interp(ti, si, baro_seg[col].values.astype(float))
+    plot_barometers_vs_fz(df, save_path=save_plots_dir / "barometers_vs_Fz.png")
+    plot_barometers_vs_fx(df, save_path=save_plots_dir / "barometers_vs_Fx.png")
+    plot_barometers_vs_fy(df, save_path=save_plots_dir / "barometers_vs_Fy.png")
 
-    # --- Build final DataFrame (same as before, but t0 from the overlapped window) ---
-    t0 = int(comb.index.min())
-    t_rel = (comb.index.values.astype(np.int64) - t0) / 1e9
+    plt.show()  # if you want to display them immediately
     
-    final = pd.DataFrame(index=comb.index)
-    final['t'] = t_rel
-
-    for i in range(1, 7):
-        final[f'b{i}'] = out[f'b{i}'].values
-
-    if 'x_position' in comb.columns and 'y_position' in comb.columns:
-        final['-x (mm)'] = -comb['x_position'].values  # Values are already in mm
-        final['-y (mm)'] = -comb['y_position'].values  # Values are already in mm
-    else:
-        final['-x (mm)'] = np.nan
-        final['-y (mm)'] = np.nan
-
-    force_cols_map = {'Fx': 'fx', 'Fy': 'fy', 'Fz': 'fz', 'Tx': 'tx', 'Ty': 'ty', 'Tz': 'tz'}
-    for old_col, new_col in force_cols_map.items():
-        if old_col in comb.columns:
-            final[new_col] = comb[old_col].values
-        elif new_col in comb.columns:
-            final[new_col] = comb[new_col].values
-        else:
-            final[new_col] = np.nan
-
-    # --- Keep ONLY rows where all 6 barometers are valid (strict overlap) ---
-    baro_cols = [f"b{i}" for i in range(1, 7)]
-    final = final[final[baro_cols].notna().all(axis=1)].copy()
-
-    # Save to the OUTPUT_DIR
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    out_path_main = os.path.join(OUTPUT_DIR, OUTPUT_NAME)
-    try:
-        # Keep index (time_ns) labeled for traceability
-        final.to_csv(out_path_main, index_label='time_ns')
-        print(f"Saved merged CSV: {out_path_main}")
-    except Exception as e:
-        print(f"Failed to save CSV to {out_path_main}: {e}")
-
-    # --- Plots (same names + destination = OUTPUT_DIR) ---
-    plot_barometers(final, OUTPUT_DIR, f"plot_barometers_{test_num}.png")
-    plot_wrench(final,     OUTPUT_DIR, f"plot_ATI_{test_num}.png")
-    # Only draw overlay if b1 and Fz/fz present
-    if 'b1' in final.columns and (('Fz' in final.columns) or ('fz' in final.columns)):
-        plot_b1_and_fz(final, OUTPUT_DIR, f"plot_b1_vs_fz_{test_num}.png")
-    else:
-        print("Skipping b1 vs Fz overlay (missing columns).")
-    # Path plot (will fall back to x_position/y_position)
-    plot_path(final, OUTPUT_DIR, f"plot_path_{test_num}.png")
-
-    # Quick summary
-    t_series = final['t'].dropna()
-    span = (t_series.iloc[-1] - t_series.iloc[0]) if len(t_series) else np.nan
+    masked = apply_spatial_filter(merged)
     
-    # Calculate sampling rate
-    if len(t_series) > 1:
-        # Calculate time differences between consecutive samples
-        dt = np.diff(t_series)
-        mean_dt = np.mean(dt)
-        std_dt = np.std(dt)
-        sampling_rate = 1.0 / mean_dt
-        print(f"\nSampling Rate Analysis:")
-        print(f"Average sampling rate: {sampling_rate:.2f} Hz")
-        print(f"Average time between samples: {mean_dt*1000:.2f} ms ± {std_dt*1000:.2f} ms")
-    
-    # Print force ranges
-    print("\nForce Ranges:")
-    for force in ['fx', 'fy', 'fz']:
-        if force in final.columns:
-            force_data = final[force].dropna()
-            if len(force_data) > 0:
-                print(f"{force.upper()}:")
-                print(f"  Min: {force_data.min():.2f} N")
-                print(f"  Max: {force_data.max():.2f} N")
-                print(f"  Range: {force_data.max() - force_data.min():.2f} N")
-    
-    print(f"\nRows: {len(final)}, time span: {float(span):.3f} s")
-    if final[[f"b{i}" for i in range(1,7)]].isna().all().all():
-        print("Note: all barometer values are NaN (no overlap or wrong barometer file).")
-        
-    # Generate distribution plots
-    plot_distributions(final, OUTPUT_DIR)
+    plot_path_xy_filtered(
+        out_dir=str(save_plots_dir),
+        X_mm=masked["x_position_mm"].to_numpy(),
+        Y_mm=masked["y_position_mm"].to_numpy(),
+        t_s=masked["time"].to_numpy(),
+        test_num=TEST_NUM
+    )
+
+
+    if masked.empty:
+        print("WARNING: no rows after spatial filter — saving UNSFILTERED synchronized data instead.")
+        masked = merged
+
+    # --- rename columns for export ---
+    masked = masked.rename(columns={
+        'x_position_mm': 'x', 'y_position_mm': 'y', 'z_position_mm': 'z',
+        'Fx': 'fx', 'Fy': 'fy', 'Fz': 'fz', 'fx': 'fx', 'fy': 'fy', 'fz': 'fz',
+        'barometer 1': 'b1', 'barometer 2': 'b2', 'barometer 3': 'b3',
+        'barometer 4': 'b4', 'barometer 5': 'b5', 'barometer 6': 'b6',
+    })
+
+    # --- select and save only desired columns ---
+    masked = masked[['x','y','z','fx','fy','fz','b1','b2','b3','b4','b5','b6']]
+
+    masked.to_csv(OUTPUT_FILE, index=False)
+    print(f"\nSaved: {OUTPUT_FILE}")
+    print(f"Rows: {len(masked)} | Columns: {list(masked.columns)}")
+
 
 if __name__ == "__main__":
-    pd.set_option('display.width', 140)
     main()

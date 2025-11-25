@@ -17,6 +17,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from plot_style import apply_plot_style
+apply_plot_style()
 
 # ===========================
 # ===== USER SETTINGS =======
