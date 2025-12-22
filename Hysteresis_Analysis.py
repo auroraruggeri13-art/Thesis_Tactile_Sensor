@@ -1,164 +1,107 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Solo plot essenziali per barometri:
-1) **Smoothing**: raw vs smoothed + picchi rilevati (valle→picco→valle).
-2) **Loading vs Unloading** per canale: metà ascendente (tempo invertito) e metà discendente
-   (tempo dal picco), così entrambe partono da x=0 al picco.
+Hysteresis plots: Fz (x-axis) vs barometers B1..B6 (y-axis)
 
-Niente CSV/metriche: solo figure.
+- Loads synchronized_events_{TEST_NUM}.csv from the standard test directory
+- Creates 6 stacked subplots: B1..B6 vs Fz
+- Saves the figure into the 'hysterisis' folder under the Thesis root
 """
 
-import re
+import os
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.signal import savgol_filter
 
-# ================== CONFIG (edit) ==================
-CSV_PATH = r"C:\\Users\\aurir\\OneDrive\\Desktop\\Thesis- Biorobotics Lab\\Sensor-Logs\\datalog_2025-11-06_14-35-45.csv"
-PRESSURE_REGEX = r"(p\d+|pressure|baro|barometer)"
-SMOOTH_WINDOW = 3          # finestra media mobile (dispari ≥3)
-MIN_PROM_PCT = 2.0         # prominenza minima del picco (% dell'intervallo del segnale)
-MIN_GAP = 3                # campioni minimi tra valle/ picco/ valle
-# ===================================================
+# =========================== CONFIGURATION ===========================
 
-# --------- helper ---------
-def get_time_seconds(df):
-    if 'Time(ms)' in df.columns:
-        return df['Time(ms)'].astype(float).to_numpy() / 1000.0
-    time_cols = [c for c in df.columns if re.search(r"(time|timestamp|ts)", str(c), re.I)]
-    if not time_cols:
-        raise ValueError('Colonna tempo non trovata')
-    col = time_cols[0]
-    s = df[col].astype(str)
-    if ':' in str(s.iloc[0]):
-        def to_s(x):
-            h,m,sx = str(x).split(':'); return float(h)*3600 + float(m)*60 + float(sx)
-        return s.map(to_s).to_numpy(float)
-    return pd.to_numeric(s, errors='coerce').to_numpy(float)
+TEST_NUM = 4350
+VERSION_NUM = 4
 
+# Smoothing parameters
+SMOOTH_WINDOW = 51  # Window length (must be odd)
+SMOOTH_POLY = 3     # Polynomial order
 
-def smooth_ma(y, w):
-    w = max(3, int(w)|1)
-    pad = w//2
-    return np.convolve(np.pad(y, (pad,pad), mode='edge'), np.ones(w)/w, mode='valid')
+BASE_DIR = Path(r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data")
+DATA_DIR = BASE_DIR / f"test {TEST_NUM} - sensor v{VERSION_NUM}"
 
+# Input file (adjust name if needed)
+CSV_FILE = DATA_DIR / f"synchronized_events_{TEST_NUM}.csv"
 
-def find_cycles(y):
-    dy = np.gradient(y)
-    sgn = np.sign(dy); sgn[sgn==0]=1
+# Output folder for hysteresis plots
+HYST_BASE = Path(r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab")
+HYST_DIR = HYST_BASE / "hysterisis"
+HYST_DIR.mkdir(parents=True, exist_ok=True)
+
+# Output figure name
+OUT_FIG = HYST_DIR / f"hysteresis_Fz_vs_Barometers_test{TEST_NUM}.png"
+
+# ============================= LOAD DATA =============================
+
+if not CSV_FILE.exists():
+    raise FileNotFoundError(f"Could not find input file: {CSV_FILE}")
+
+df = pd.read_csv(CSV_FILE)
+
+# Expect columns named 'fz' and 'b1'..'b6'
+required_cols = ["fz"] + [f"b{i}" for i in range(1, 7)]
+missing = [c for c in required_cols if c not in df.columns]
+if missing:
+    raise ValueError(f"Missing columns in CSV: {missing}")
+
+# =============================== PLOTS ===============================
+
+fz = df["fz"].values
+
+# Apply smoothing to fz and barometer data
+fz_smooth = savgol_filter(fz, SMOOTH_WINDOW, SMOOTH_POLY)
+
+fig, axes = plt.subplots(2, 3, figsize=(15, 10), sharex=True)
+
+for i, ax in enumerate(axes.flat, start=1):
+    bi = df[f"b{i}"].values
+    bi_smooth = savgol_filter(bi, SMOOTH_WINDOW, SMOOTH_POLY)
     
-    # Find both maxima and minima
-    maxima = np.where((sgn[:-1] > 0) & (sgn[1:] < 0))[0] + 1
-    minima = np.where((sgn[:-1] < 0) & (sgn[1:] > 0))[0] + 1
+    # Calculate hysteresis using standard formula:
+    # Hysteresis ratio (%) = (Δhyst / Full-scale output) × 100%
+    # where:
+    # - Δhyst = maximum difference between loading and unloading at same force
+    # - Full-scale output = max output - min output
     
-    # Determine which type of peaks to use (maxima or minima) based on prominence
-    rng = np.ptp(y)
-    min_prom = rng * (MIN_PROM_PCT/100.0)
+    # Split data into loading (ascending fz) and unloading (descending fz)
+    midpoint = len(fz_smooth) // 2
     
-    # Calculate prominence for both types
-    max_prominences = []
-    for ip in maxima:
-        lv = minima[minima < ip]; rv = minima[minima > ip]
-        if len(lv) > 0 and len(rv) > 0:
-            base = min(y[lv[-1]], y[rv[0]])
-            max_prominences.append(y[ip] - base)
-            
-    min_prominences = []
-    for ip in minima:
-        lv = maxima[maxima < ip]; rv = maxima[maxima > ip]
-        if len(lv) > 0 and len(rv) > 0:
-            base = max(y[lv[-1]], y[rv[0]])
-            min_prominences.append(base - y[ip])
+    # Maximum hysteresis (Δhyst): max difference between curves
+    delta_hyst = np.max(np.abs(bi_smooth[:midpoint] - bi_smooth[midpoint:][::-1][:midpoint]))
     
-    # Choose peaks based on which type has larger average prominence
-    max_prom_avg = np.mean(max_prominences) if max_prominences else 0
-    min_prom_avg = np.mean(min_prominences) if min_prominences else 0
+    # Full-scale output (FSO)
+    full_scale_output = np.max(bi_smooth) - np.min(bi_smooth)
     
-    peaks = maxima if max_prom_avg >= min_prom_avg else minima
-    valleys = minima if max_prom_avg >= min_prom_avg else maxima
-    is_maximum = max_prom_avg >= min_prom_avg
+    # Hysteresis ratio (%)
+    hysteresis_percent = (delta_hyst / full_scale_output * 100) if full_scale_output > 0 else 0
     
-    cycles = []
-    for ip in peaks:
-        lv = valleys[valleys < ip]; rv = valleys[valleys > ip]
-        if len(lv)==0 or len(rv)==0: continue
-        il = lv[-1]; ir = rv[0]
-        if ip-il < MIN_GAP or ir-ip < MIN_GAP: continue
-        base = min(y[il], y[ir]) if is_maximum else max(y[il], y[ir])
-        prominence = y[ip] - base if is_maximum else base - y[ip]
-        if prominence < min_prom: continue
-        cycles.append((il, ip, ir))
-    return cycles
+    ax.plot(-fz_smooth, bi_smooth, linewidth=2.5, color='red', alpha=0.7)
+    ax.set_ylabel(f"B{i} Pressure", fontsize=10)
+    ax.set_title(f"B{i} vs Fz", fontsize=11, fontweight='bold')
+    ax.grid(True, alpha=0.5, linestyle='--', linewidth=1)
+    
+    # Add hysteresis value in a text box
+    textstr = f'Δhyst: {delta_hyst:.3f}\nHyst: {hysteresis_percent:.1f}%'
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
+    ax.text(0.05, 0.95, textstr, transform=ax.transAxes, fontsize=9,
+            verticalalignment='top', bbox=props)
 
-# ---------------- main ----------------
-def main():
-    df = pd.read_csv(CSV_PATH)
-    t = get_time_seconds(df)
-    pres_cols = [c for c in df.columns if re.search(PRESSURE_REGEX, str(c), re.I)]
-    if not pres_cols:
-        raise ValueError('Nessuna colonna di pressione trovata')
+# Add x-label to bottom row
+for ax in axes[1, :]:
+    ax.set_xlabel("Fz (N)", fontsize=10)
 
-    for col in pres_cols:
-        y_raw = pd.to_numeric(df[col], errors='coerce').to_numpy(float)
-        y = smooth_ma(y_raw, SMOOTH_WINDOW)
-        cycles = find_cycles(y)
-        if len(cycles)==0:
-            print(f"{col}: nessun ciclo rilevato")
-            continue
+plt.suptitle(f"Hysteresis Analysis: Barometer Response vs Force (Test {TEST_NUM})", 
+             fontsize=13, fontweight='bold', y=0.995)
+plt.tight_layout()
+fig.savefig(OUT_FIG, dpi=300, bbox_inches='tight')
+plt.show()
 
-        # --- Plot 1: smoothing + picchi ---
-        fig1, ax1 = plt.subplots(figsize=(11,4))
-        ax1.plot(t, y_raw, alpha=0.35, label='raw')
-        ax1.plot(t[:len(y)], y, label='smoothed')
-        for (il,ip,ir) in cycles:
-            ax1.axvline(t[ip], ls='--', alpha=0.25)
-            ax1.plot(t[ip], y[ip], '^')
-        ax1.set_title(f'{col} — smoothing & peaks')
-        ax1.set_xlabel('tempo [s]'); ax1.set_ylabel('pressione')
-        ax1.grid(True, alpha=0.3); ax1.legend(); fig1.tight_layout()
-
-        # --- Plot 2: loading vs unloading (overlapped at peak, both start x=0) ---
-        fig2, ax2 = plt.subplots(figsize=(7,5))
-        for k,(il,ip,ir) in enumerate(cycles, start=1):
-            # Loading: valley -> peak. Build time-from-peak so it starts at 0 and increases.
-            t_up, y_up = t[il:ip+1], y[il:ip+1]
-            x_up = (t_up[-1] - t_up)           # 0 at peak, T_up at valley
-            x_up = x_up[::-1]; y_up = y_up[::-1]  # make it 0..T_up (increasing)
-
-            # Unloading: peak -> valley. Time-from-peak naturally starts at 0.
-            t_dn, y_dn = t[ip:ir+1], y[ip:ir+1]
-            x_dn = (t_dn - t_dn[0])            # 0..T_dn
-
-            # Calculate hysteresis metrics for this cycle
-            # Resample both curves to same number of points for accurate area calculation
-            n_points = 100
-            x_grid = np.linspace(0, min(x_up.max(), x_dn.max()), n_points)
-            y_up_resampled = np.interp(x_grid, x_up, y_up)
-            y_dn_resampled = np.interp(x_grid, x_dn, y_dn)
-            
-            # Calculate areas
-            area_between = np.trapz(np.abs(y_up_resampled - y_dn_resampled), x_grid)
-            area_loading = np.trapz(np.abs(y_up_resampled), x_grid)
-            
-            # Calculate hysteresis percentage
-            hysteresis_pct = 100 * area_between / area_loading if area_loading > 0 else 0
-            
-            ax2.plot(x_up, y_up, alpha=0.9, 
-                    label=f'loading (cycle {k})' if k==1 else None)
-            ax2.plot(x_dn, y_dn, '--', alpha=0.9, 
-                    label=f'unloading (cycle {k})' if k==1 else None)
-            
-            print(f"{col} - Cycle {k} Hysteresis: {hysteresis_pct:.1f}%")
-
-        ax2.set_title(f'{col} — overlapped at peak (x=0)')
-        ax2.set_xlabel('time from peak [s]')
-        ax2.set_ylabel('pressure (smoothed)')
-        ax2.grid(True, alpha=0.3)
-        ax2.legend(loc='best')
-        fig2.tight_layout()
-
-    plt.show()
-
-if __name__ == '__main__':
-    main()
+print(f"Saved hysteresis figure to: {OUT_FIG}")

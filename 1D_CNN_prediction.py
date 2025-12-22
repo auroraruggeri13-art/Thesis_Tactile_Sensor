@@ -1,387 +1,405 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TCN for tactile time series with:
-- X scaler (fit on train), Y scaler (fit on train)
-- inverse-variance weighted MSE over targets
-- ReduceLROnPlateau scheduler, early stopping
-- optional derivative channels
+1D CNN for predicting x, y, fx, fy, fz from 6 barometers
+using sliding-window time series input.
+
+- Input per sample: window of raw barometer values
+  shape: (window_length, 6)
+- Model: Conv1D -> Conv1D -> GlobalAveragePooling1D -> Dense -> Dense(5)
+- Uses same CSV format as previous RF/LightGBM scripts.
 """
 
-import os, math, pickle
-from dataclasses import dataclass
-from typing import List, Tuple
+import os
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import matplotlib.pyplot as plt
+import pickle
 
-# =========================
-# ======  CONFIG  =========
-# =========================
-@dataclass
-class Config:
-    # Data
-    DATA_DIRECTORY: str = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data"
-    CSV_FILENAMES: List[str] = None
-    BARO_COLS: List[str] = None
-    TARGETS: List[str] = None
-    TIME_COL: str = None  # optional
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, r2_score
 
-    # Features
-    ADD_DERIVATIVES: bool = True  # add Δb/Δt as extra channels
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv1D, GlobalAveragePooling1D, Dense, Dropout, BatchNormalization
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 
-    # Windowing
-    SEQ_LEN: int = 256
-    PRED_OFFSET: int = 0
-    STRIDE: int = 4
+# ============================================================
+# ==================== GPU/CUDA SETUP ========================
+# ============================================================
 
-    # Splits
-    TRAIN_FRAC: float = 0.8
-    VAL_FRAC: float = 0.1  # test = rest
+# Configure TensorFlow to use GPU if available
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        # Enable memory growth to avoid allocating all GPU memory at once
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"\n{'='*70}")
+        print(f"GPU DETECTED: {len(gpus)} GPU(s) available")
+        for i, gpu in enumerate(gpus):
+            print(f"  GPU {i}: {gpu.name}")
+        print(f"{'='*70}\n")
+    except RuntimeError as e:
+        print(f"GPU configuration error: {e}")
+else:
+    print("\n" + "="*70)
+    print("NO GPU DETECTED - Running on CPU")
+    print("To use GPU, install: pip install tensorflow[and-cuda]")
+    print("="*70 + "\n")
 
-    # TCN
-    IN_CHANNELS: int = 6   # will be updated if derivatives added
-    HIDDEN_CHANNELS: int = 256
-    N_BLOCKS: int = 6
-    KERNEL_SIZE: int = 3
-    DROPOUT: float = 0.10
+# ============================================================
+# ======================= CONFIG =============================
+# ============================================================
 
-    # Optimization
-    LR: float = 1e-3
-    WEIGHT_DECAY: float = 1e-4
-    BATCH_SIZE: int = 256
-    EPOCHS: int = 100
-    EARLY_STOP_PATIENCE: int = 15
-    USE_WEIGHTED_LOSS: bool = True
+DATA_DIRECTORY = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\train_validation_test_data"
+sensor_version = 4
+TRAIN_FILENAME = f"train_data_v{sensor_version}.csv"
+TEST_FILENAME  = f"test_data_v{sensor_version}.csv"
 
-    # Saving
-    SAVE_DIR: str = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\models parameters\tcn"
-    MODEL_NAME: str = "tcn_v4.pt"
-    X_SCALER_NAME: str = "tcn_x_scaler_v4.pkl"
-    Y_SCALER_NAME: str = "tcn_y_scaler_v4.pkl"
-    META_NAME: str = "tcn_meta_v4.pkl"
+TIME_COL   = "t"
+BARO_COLS  = ["b1", "b2", "b3", "b4", "b5", "b6"]
+TARGET_COLS = ["x", "y", "fx", "fy", "fz"]
 
-def default_config() -> Config:
-    cfg = Config()
-    cfg.CSV_FILENAMES = [
-        r"test 4101 - sensor v4\synchronized_events_4101.csv",
-        # add more if needed
-    ]
-    cfg.BARO_COLS = ['b1','b2','b3','b4','b5','b6']
-    cfg.TARGETS = ['x','y','fx','fy','fz']
-    return cfg
+RANDOM_STATE = 42
 
-# =========================
-# ======  DATASET  ========
-# =========================
-class SlidingWindowDataset(Dataset):
-    def __init__(self, X_2d: np.ndarray, Y_2d: np.ndarray, seq_len: int, pred_offset: int = 0, stride: int = 1):
-        assert len(X_2d) == len(Y_2d)
-        self.X = X_2d
-        self.Y = Y_2d
-        self.seq_len = seq_len
-        self.pred_offset = pred_offset
-        self.stride = stride
+WINDOW_RADIUS   = 15   # 31-sample window (increased for more context)
+APPLY_DENOISING = True
+DENOISE_WINDOW  = 5
 
-        T = len(X_2d)
-        self.indices = []
-        end = T - pred_offset
-        i = 0
-        while i + seq_len <= end:
-            self.indices.append(i)
-            i += stride
+VAL_SIZE   = 0.2
+BATCH_SIZE = 128
+EPOCHS     = 80
 
-    def __len__(self):
-        return len(self.indices)
+SAVE_DIR = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\models parameters\cnn_models"
 
-    def __getitem__(self, idx: int):
-        s = self.indices[idx]
-        x_seq = self.X[s:s + self.seq_len]                       # (L, F)
-        y_t   = self.Y[s + self.seq_len - 1 - self.pred_offset]  # (O,)
-        return torch.from_numpy(x_seq).float(), torch.from_numpy(y_t).float()
 
-def collate_seq(batch):
-    xs, ys = zip(*batch)
-    X = torch.stack(xs, dim=0).permute(0, 2, 1)  # (B, F, L)
-    y = torch.stack(ys, dim=0)                   # (B, O)
+# ============================================================
+# ==================== PREPROCESS HELPERS ====================
+# ============================================================
+
+def set_seeds(seed=RANDOM_STATE):
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+
+
+def maybe_denoise(df, baro_cols):
+    if not APPLY_DENOISING:
+        return df
+    df = df.copy()
+    win = DENOISE_WINDOW
+    for col in baro_cols:
+        df[col] = df[col].rolling(win, center=True).mean().bfill().ffill()
+    return df
+
+
+def build_window_sequences(df, baro_cols, time_col, target_cols, window_radius):
+    """
+    Build:
+      X: (num_windows, window_length, 18)  # raw + d1 + d2 for 6 barometers = 18 channels
+      y: (num_windows, 5)
+    
+    Same as RF/XGB script: includes first and second derivatives for dynamic information.
+    """
+    df = df.sort_values(time_col).reset_index(drop=True).copy()
+    df = maybe_denoise(df, baro_cols)
+
+    N = len(df)
+    R = window_radius
+    if N <= 2 * R:
+        raise ValueError(f"Not enough samples ({N}) for window radius {R}")
+
+    # Build multi-channel data: raw + d1 + d2 (same as RF/XGB feature engineering)
+    series_list = []
+    for col in baro_cols:
+        raw = df[col].values
+        d1  = df[col].diff().fillna(0.0).values
+        d2  = df[col].diff().diff().fillna(0.0).values
+        
+        series_list.append(raw)
+        series_list.append(d1)
+        series_list.append(d2)
+    
+    # Shape: (N, num_channels) where num_channels = 18 for raw+d1+d2
+    multi_data = np.stack(series_list, axis=1).astype(np.float32)
+    
+    targets = df[target_cols].values
+    window_len = 2 * R + 1
+    M = N - 2 * R
+    num_channels = multi_data.shape[1]
+
+    X = np.zeros((M, window_len, num_channels), dtype=np.float32)
+    y = np.zeros((M, len(target_cols)), dtype=np.float32)
+
+    for idx, center in enumerate(range(R, N - R)):
+        start = center - R
+        end   = center + R + 1
+        X[idx, :, :] = multi_data[start:end, :]
+        y[idx, :]    = targets[center, :]
+
+    print(f"Built sequences with {num_channels} channels (6 baro × 3 [raw+d1+d2])")
     return X, y
 
-# =========================
-# ======  MODEL  ==========
-# =========================
-class Chomp1d(nn.Module):
-    def __init__(self, chomp_size: int):
-        super().__init__()
-        self.chomp_size = chomp_size
-    def forward(self, x):
-        return x[:, :, :-self.chomp_size].contiguous()
 
-class TemporalBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size, dilation, dropout):
-        super().__init__()
-        padding = (kernel_size - 1) * dilation
-        self.net = nn.Sequential(
-            nn.Conv1d(in_ch, out_ch, kernel_size, padding=padding, dilation=dilation),
-            Chomp1d(padding),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Conv1d(out_ch, out_ch, kernel_size, padding=padding, dilation=dilation),
-            Chomp1d(padding),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
-        self.downsample = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else None
-        self._init()
+def standardize_features(X_train, X_val, X_test):
+    """
+    Standardize features based on TRAIN ONLY, then apply to val+test.
+    """
+    orig_train_shape = X_train.shape
+    orig_val_shape   = X_val.shape
+    orig_test_shape  = X_test.shape
 
-    def _init(self):
-        for m in self.net:
-            if isinstance(m, nn.Conv1d):
-                nn.init.kaiming_normal_(m.weight)
-                if m.bias is not None: nn.init.zeros_(m.bias)
-        if self.downsample is not None:
-            nn.init.kaiming_normal_(self.downsample.weight)
-            if self.downsample.bias is not None: nn.init.zeros_(self.downsample.bias)
+    # Flatten time dim for scaling
+    X_train_flat = X_train.reshape(-1, orig_train_shape[-1])
+    X_val_flat   = X_val.reshape(-1,   orig_val_shape[-1])
+    X_test_flat  = X_test.reshape(-1,  orig_test_shape[-1])
 
-    def forward(self, x):
-        out = self.net(x)
-        res = x if self.downsample is None else self.downsample(x)
-        return torch.relu(out + res)
+    mean = X_train_flat.mean(axis=0, keepdims=True)
+    std  = X_train_flat.std(axis=0, keepdims=True) + 1e-8
 
-class TCN(nn.Module):
-    def __init__(self, in_channels, out_channels, n_blocks=6, hidden_channels=256, kernel_size=3, dropout=0.1):
-        super().__init__()
-        layers = []
-        ch_in = in_channels
-        dil = 1
-        for _ in range(n_blocks):
-            layers.append(TemporalBlock(ch_in, hidden_channels, kernel_size, dil, dropout))
-            ch_in = hidden_channels
-            dil *= 2
-        self.tcn = nn.Sequential(*layers)
-        self.head = nn.Sequential(
-            nn.Conv1d(hidden_channels, hidden_channels, 1),
-            nn.ReLU(),
-            nn.Conv1d(hidden_channels, out_channels, 1),
-        )
-    def forward(self, x):         # x: (B,C,L)
-        h = self.tcn(x)           # (B,H,L)
-        h_last = h[:, :, -1:]     # (B,H,1)
-        out = self.head(h_last)   # (B,O,1)
-        return out.squeeze(-1)    # (B,O)
+    X_train_flat_std = (X_train_flat - mean) / std
+    X_val_flat_std   = (X_val_flat   - mean) / std
+    X_test_flat_std  = (X_test_flat  - mean) / std
 
-def tcn_receptive_field(n_blocks: int, kernel_size: int) -> int:
-    return 1 + 2*(kernel_size - 1)*(2**n_blocks - 1)
+    X_train_std = X_train_flat_std.reshape(orig_train_shape)
+    X_val_std   = X_val_flat_std.reshape(orig_val_shape)
+    X_test_std  = X_test_flat_std.reshape(orig_test_shape)
 
-# =========================
-# ======  UTILS  ==========
-# =========================
-def print_metrics(y_true, y_pred, targets: List[str]):
-    print("\nPER-TARGET METRICS")
-    for i, t in enumerate(targets):
-        mae = mean_absolute_error(y_true[:, i], y_pred[:, i])
-        rmse = mean_squared_error(y_true[:, i], y_pred[:, i], squared=False)
-        r2 = r2_score(y_true[:, i], y_pred[:, i])
-        unit = "mm" if t in ['x','y'] else "N"
-        print(f"  {t:>2s} | MAE: {mae:.4f} {unit} | RMSE: {rmse:.4f} {unit} | R²: {r2:.4f}")
+    scaler = {"mean": mean, "std": std}
+    return X_train_std, X_val_std, X_test_std, scaler
 
-    if set(['x','y']).issubset(targets):
-        ix = [targets.index('x'), targets.index('y')]
-        err = y_true[:, ix] - y_pred[:, ix]
-        comp_rmse = np.sqrt((err**2).mean())
-        eucl = np.sqrt((err**2).sum(axis=1))
-        eucl_rmse = np.sqrt((eucl**2).mean())
-        print("\nContact (x,y):")
-        print(f"  Component RMSE: {comp_rmse:.4f} mm | Euclidean RMSE: {eucl_rmse:.4f} mm | Mean dist: {eucl.mean():.4f} mm")
 
-    f_names = [t for t in ['fx','fy','fz'] if t in targets]
-    if f_names:
-        ix = [targets.index(t) for t in f_names]
-        err = y_true[:, ix] - y_pred[:, ix]
-        comp_rmse = np.sqrt((err**2).mean())
-        eucl = np.sqrt((err**2).sum(axis=1))
-        eucl_rmse = np.sqrt((eucl**2).mean())
-        print(f"\nForce ({', '.join(f_names)}):")
-        print(f"  Component RMSE: {comp_rmse:.4f} N | Euclidean RMSE: {eucl_rmse:.4f} N | Mean magnitude: {eucl.mean():.4f} N")
+def standardize_targets(y_train, y_val):
+    """
+    Standardize targets based on TRAIN ONLY, apply to val.
+    (Test targets stay in physical units; we only standardize predictions.)
+    """
+    mean = y_train.mean(axis=0, keepdims=True)
+    std  = y_train.std(axis=0, keepdims=True) + 1e-8
 
-def train_one_epoch(model, loader, device, criterion, optimizer):
-    model.train()
-    total = 0.0; n = 0
-    for X, y in loader:
-        X = X.to(device); y = y.to(device)
-        optimizer.zero_grad()
-        pred = model(X)
-        loss = criterion(pred, y)
-        loss.backward()
-        optimizer.step()
-        total += loss.item() * len(y); n += len(y)
-    return total / max(1, n)
+    y_train_std = (y_train - mean) / std
+    y_val_std   = (y_val   - mean) / std
 
-@torch.no_grad()
-def eval_epoch(model, loader, device, criterion):
-    model.eval()
-    total = 0.0; n = 0
-    ys, ps = [], []
-    for X, y in loader:
-        X = X.to(device); y = y.to(device)
-        pred = model(X)
-        loss = criterion(pred, y)
-        total += loss.item() * len(y); n += len(y)
-        ys.append(y.cpu().numpy()); ps.append(pred.cpu().numpy())
-    y_full = np.vstack(ys) if ys else np.zeros((0,1))
-    p_full = np.vstack(ps) if ps else np.zeros((0,1))
-    return total / max(1, n), y_full, p_full
+    scaler = {"mean": mean, "std": std}
+    return y_train_std, y_val_std, scaler
 
-# =========================
-# ======  MAIN  ===========
-# =========================
+
+def inverse_standardize(y_std, scaler):
+    return y_std * scaler["std"] + scaler["mean"]
+
+
+# ============================================================
+# ======================= MODEL BUILD ========================
+# ============================================================
+
+def build_cnn_model(window_len, n_channels, n_targets):
+    model = Sequential()
+    model.add(Conv1D(32, kernel_size=5, padding="same",
+                     activation="relu", input_shape=(window_len, n_channels)))
+    model.add(BatchNormalization())
+
+    model.add(Conv1D(64, kernel_size=5, padding="same", activation="relu"))
+    model.add(BatchNormalization())
+
+    model.add(GlobalAveragePooling1D())
+    model.add(Dense(64, activation="relu"))
+    model.add(Dropout(0.2))
+    model.add(Dense(n_targets, activation="linear"))
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        loss="mse",
+        metrics=["mae"],
+    )
+    return model
+
+
+# ============================================================
+# ======================= PLOTTING ===========================
+# ============================================================
+
+def plot_pred_vs_actual(y_true, y_pred, target_cols, title_suffix=""):
+    n_targets = len(target_cols)
+    fig, axes = plt.subplots(1, n_targets, figsize=(4 * n_targets, 4))
+    if n_targets == 1:
+        axes = [axes]
+
+    for i, col in enumerate(target_cols):
+        ax = axes[i]
+        true_vals = y_true[:, i]
+        pred_vals = y_pred[:, i]
+
+        ax.scatter(true_vals, pred_vals, alpha=0.4, s=10)
+
+        min_val = min(true_vals.min(), pred_vals.min())
+        max_val = max(true_vals.max(), pred_vals.max())
+        span = max_val - min_val
+        lims = [min_val - 0.05*span, max_val + 0.05*span]
+
+        ax.plot(lims, lims, "r--", linewidth=1.0)
+        mae = mean_absolute_error(true_vals, pred_vals)
+        r2  = r2_score(true_vals, pred_vals)
+
+        ax.set_title(f"{col}\nMAE: {mae:.2f} | R²: {r2:.3f}", fontsize=9)
+        ax.set_xlabel("Actual", fontsize=8)
+        ax.set_ylabel("Predicted", fontsize=8)
+        ax.grid(alpha=0.3)
+        ax.set_xlim(lims)
+        ax.set_ylim(lims)
+
+    if title_suffix:
+        plt.suptitle(f"Predicted vs Actual ({title_suffix})")
+    plt.tight_layout()
+    return fig
+
+
+def calculate_grouped_rmse(y_true, y_pred, target_names):
+    print("\n" + "="*70 + "\nGROUPED RMSE METRICS\n" + "="*70)
+
+    # Contact location
+    contact_idx = [i for i, n in enumerate(target_names) if n in ["x", "y"]]
+    if len(contact_idx) >= 2:
+        t_true = y_true[:, contact_idx]
+        t_pred = y_pred[:, contact_idx]
+        err = t_true - t_pred
+        rmse_comp = np.sqrt(np.mean(err**2))
+        dist = np.sqrt(np.sum(err**2, axis=1))
+        rmse_euc = np.sqrt(np.mean(dist**2))
+        print("\nContact Location (x, y):")
+        print(f"  - Component-wise RMSE: {rmse_comp:.4f} mm")
+        print(f"  - Euclidean RMSE:      {rmse_euc:.4f} mm")
+        print(f"  - Mean error distance: {np.mean(dist):.4f} mm")
+
+    # Forces
+    force_idx = [i for i, n in enumerate(target_names) if n in ["fx", "fy", "fz"]]
+    if force_idx:
+        t_true = y_true[:, force_idx]
+        t_pred = y_pred[:, force_idx]
+        err = t_true - t_pred
+        rmse_comp = np.sqrt(np.mean(err**2))
+        mag = np.sqrt(np.sum(err**2, axis=1))
+        rmse_euc = np.sqrt(np.mean(mag**2))
+        names = [target_names[i] for i in force_idx]
+        print(f"\n{len(force_idx)}-DOF Force Vector ({', '.join(names)}):")
+        print(f"  - Component-wise RMSE: {rmse_comp:.4f} N")
+        print(f"  - Euclidean RMSE:      {rmse_euc:.4f} N")
+        print(f"  - Mean error magnitude: {np.mean(mag):.4f} N")
+
+
+# ============================================================
+# ======================== MAIN =============================
+# ============================================================
+
 def main():
-    cfg = default_config()
-    os.makedirs(cfg.SAVE_DIR, exist_ok=True)
+    set_seeds()
 
-    # ---- Load & concat ----
-    dfs = []
-    for rel in cfg.CSV_FILENAMES:
-        fp = os.path.join(cfg.DATA_DIRECTORY, rel)
-        if not os.path.exists(fp):
-            print(f"[WARN] Missing: {fp} (skipped)")
-            continue
-        df = pd.read_csv(fp)
-        df.columns = df.columns.str.strip().str.lower()
-        dfs.append(df)
-    if not dfs: raise FileNotFoundError("No valid CSVs found.")
-    df = pd.concat(dfs, ignore_index=True)
+    # ---------- Load data ----------
+    train_path = os.path.join(DATA_DIRECTORY, TRAIN_FILENAME)
+    test_path  = os.path.join(DATA_DIRECTORY, TEST_FILENAME)
 
-    need_cols = [c for c in cfg.BARO_COLS + cfg.TARGETS if c in df.columns]
-    df = df[need_cols].copy()
+    train_df = pd.read_csv(train_path, skipinitialspace=True)
+    train_df.columns = train_df.columns.str.strip()
+    test_df  = pd.read_csv(test_path, skipinitialspace=True)
+    test_df.columns = test_df.columns.str.strip()
 
-    # ---- Build X (optionally add derivatives) ----
-    X_raw = df[cfg.BARO_COLS].to_numpy(dtype=np.float32)
-    if cfg.ADD_DERIVATIVES:
-        dX = np.vstack([np.zeros((1, X_raw.shape[1]), dtype=X_raw.dtype), np.diff(X_raw, axis=0)])
-        X_raw = np.hstack([X_raw, dX])   # doubles feature count
-    cfg.IN_CHANNELS = X_raw.shape[1]
-    Y_raw = df[cfg.TARGETS].to_numpy(dtype=np.float32)
+    print("Loaded train data with columns:", train_df.columns.tolist())
+    print("Loaded test data with columns:", test_df.columns.tolist())
+    print(f"Train samples (rows): {len(train_df)}, Test samples (rows): {len(test_df)}")
 
-    # ---- Time-based split on raw ----
-    T = len(df)
-    i_train_end = int(T * cfg.TRAIN_FRAC)
-    i_val_end   = int(T * (cfg.TRAIN_FRAC + cfg.VAL_FRAC))
-    X_train_raw, X_val_raw, X_test_raw = X_raw[:i_train_end], X_raw[i_train_end:i_val_end], X_raw[i_val_end:]
-    Y_train_raw, Y_val_raw, Y_test_raw = Y_raw[:i_train_end], Y_raw[i_train_end:i_val_end], Y_raw[i_val_end:]
+    needed_cols = [TIME_COL] + BARO_COLS + TARGET_COLS
+    train_df = train_df.dropna(subset=needed_cols).reset_index(drop=True)
+    test_df  = test_df.dropna(subset=needed_cols).reset_index(drop=True)
 
-    # ---- Scale X (fit on train) ----
-    x_scaler = StandardScaler()
-    X_train = x_scaler.fit_transform(X_train_raw)
-    X_val   = x_scaler.transform(X_val_raw)
-    X_test  = x_scaler.transform(X_test_raw)
+    # ---------- Build sequences ----------
+    X_train_full, y_train_full = build_window_sequences(
+        train_df, BARO_COLS, TIME_COL, TARGET_COLS, WINDOW_RADIUS
+    )
+    X_test, y_test = build_window_sequences(
+        test_df, BARO_COLS, TIME_COL, TARGET_COLS, WINDOW_RADIUS
+    )
 
-    # ---- Scale Y (fit on train) ----
-    y_scaler = StandardScaler()
-    Y_train = y_scaler.fit_transform(Y_train_raw)
-    Y_val   = y_scaler.transform(Y_val_raw)
-    Y_test  = y_scaler.transform(Y_test_raw)
+    print(f"Window length: {X_train_full.shape[1]}, Channels: {X_train_full.shape[2]}")
+    print(f"Train windows: {X_train_full.shape[0]}, Test windows: {X_test.shape[0]}")
 
-    # ---- Weighted loss (inverse variance from ORIGINAL train Y) ----
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if cfg.USE_WEIGHTED_LOSS:
-        y_std_orig = Y_train_raw.std(axis=0) + 1e-8
-        loss_w = torch.tensor(1.0 / (y_std_orig**2), dtype=torch.float32, device=device)
-        def weighted_mse(pred, target):
-            return (loss_w * (pred - target)**2).mean()
-        criterion = weighted_mse
-    else:
-        criterion = nn.MSELoss()
+    # Train/val split on windows
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train_full, y_train_full,
+        test_size=VAL_SIZE,
+        random_state=RANDOM_STATE,
+        shuffle=True,
+    )
 
-    # ---- Datasets / Loaders ----
-    train_ds = SlidingWindowDataset(X_train, Y_train, seq_len=cfg.SEQ_LEN, pred_offset=cfg.PRED_OFFSET, stride=cfg.STRIDE)
-    val_ds   = SlidingWindowDataset(X_val,   Y_val,   seq_len=cfg.SEQ_LEN, pred_offset=cfg.PRED_OFFSET, stride=cfg.STRIDE)
-    test_ds  = SlidingWindowDataset(X_test,  Y_test,  seq_len=cfg.SEQ_LEN, pred_offset=cfg.PRED_OFFSET, stride=cfg.STRIDE)
+    # ---------- Standardize features & targets ----------
+    X_train_std, X_val_std, X_test_std, feat_scaler = standardize_features(
+        X_train, X_val, X_test
+    )
+    y_train_std, y_val_std, target_scaler = standardize_targets(y_train, y_val)
 
-    train_ld = DataLoader(train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True,  drop_last=True,  collate_fn=collate_seq)
-    val_ld   = DataLoader(val_ds,   batch_size=cfg.BATCH_SIZE, shuffle=False, drop_last=False, collate_fn=collate_seq)
-    test_ld  = DataLoader(test_ds,  batch_size=cfg.BATCH_SIZE, shuffle=False, drop_last=False, collate_fn=collate_seq)
+    # ---------- Build & train model ----------
+    window_len = X_train_std.shape[1]
+    n_channels = X_train_std.shape[2]
+    n_targets  = y_train_std.shape[1]
 
-    # ---- Model ----
-    model = TCN(
-        in_channels=cfg.IN_CHANNELS,
-        out_channels=len(cfg.TARGETS),
-        n_blocks=cfg.N_BLOCKS,
-        hidden_channels=cfg.HIDDEN_CHANNELS,
-        kernel_size=cfg.KERNEL_SIZE,
-        dropout=cfg.DROPOUT,
-    ).to(device)
+    model = build_cnn_model(window_len, n_channels, n_targets)
+    model.summary()
 
-    rf = tcn_receptive_field(cfg.N_BLOCKS, cfg.KERNEL_SIZE)
-    print(f"\nTCN receptive field (timesteps): {rf} => must be ≤ SEQ_LEN={cfg.SEQ_LEN}")
-    if rf > cfg.SEQ_LEN:
-        print("[NOTE] RF exceeds window; increase SEQ_LEN or reduce blocks/kernel.")
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    version = TRAIN_FILENAME.split("train_data_")[1].split(".")[0]
+    best_model_path = os.path.join(SAVE_DIR, f"cnn_1d_best_{version}.h5")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=3, verbose=True)
+    callbacks = [
+        EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True),
+        ModelCheckpoint(best_model_path, monitor="val_loss",
+                        save_best_only=True, save_weights_only=False),
+    ]
 
-    # ---- Train with early stopping ----
-    best_val = float("inf"); best_state = None; patience = cfg.EARLY_STOP_PATIENCE
-    for epoch in range(1, cfg.EPOCHS + 1):
-        tr_loss = train_one_epoch(model, train_ld, device, criterion, optimizer)
-        vl_loss, _, _ = eval_epoch(model, val_ld, device, criterion)
-        scheduler.step(vl_loss)
-        print(f"Epoch {epoch:03d} | train MSE: {tr_loss:.6f} | val MSE: {vl_loss:.6f}")
+    history = model.fit(
+        X_train_std, y_train_std,
+        validation_data=(X_val_std, y_val_std),
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        callbacks=callbacks,
+        verbose=2,
+    )
 
-        if vl_loss < best_val - 1e-8:
-            best_val = vl_loss
-            best_state = {"epoch": epoch, "model": model.state_dict()}
-            patience = cfg.EARLY_STOP_PATIENCE
-        else:
-            patience -= 1
-            if patience == 0:
-                print("Early stopping."); break
+    print(f"\nBest model saved to: {best_model_path}")
 
-    if best_state is not None:
-        model.load_state_dict(best_state["model"])
-        print(f"Loaded best epoch: {best_state['epoch']} (val MSE={best_val:.6f})")
+    # ---------- Evaluate on test set ----------
+    y_pred_std = model.predict(X_test_std, batch_size=BATCH_SIZE)
+    y_pred = inverse_standardize(y_pred_std, target_scaler)
 
-    # ---- Evaluate on test (invert scaling) ----
-    test_mse, y_true_s, y_pred_s = eval_epoch(model, test_ld, device, criterion)
-    y_true = y_scaler.inverse_transform(y_true_s)
-    y_pred = y_scaler.inverse_transform(y_pred_s)
-    print(f"\nTest MSE (in scaled space): {test_mse:.6f}")
-    print_metrics(y_true, y_pred, cfg.TARGETS)
+    print("\n=== Test performance (CNN 1D) ===")
+    for i, col in enumerate(TARGET_COLS):
+        mae = mean_absolute_error(y_test[:, i], y_pred[:, i])
+        r2  = r2_score(y_test[:, i], y_pred[:, i])
+        print(f"{col:>3} | MAE: {mae:6.3f} | R²: {r2:6.3f}")
 
-    # ---- Save ----
-    os.makedirs(cfg.SAVE_DIR, exist_ok=True)
-    model_path  = os.path.join(cfg.SAVE_DIR, cfg.MODEL_NAME)
-    xsc_path    = os.path.join(cfg.SAVE_DIR, cfg.X_SCALER_NAME)
-    ysc_path    = os.path.join(cfg.SAVE_DIR, cfg.Y_SCALER_NAME)
-    meta_path   = os.path.join(cfg.SAVE_DIR, cfg.META_NAME)
+    # ---------- Plots ----------
+    fig = plot_pred_vs_actual(y_test, y_pred, TARGET_COLS, title_suffix="CNN1D")
+    fig_path = os.path.join(SAVE_DIR, f"cnn1d_predictions_{version}.png")
+    fig.savefig(fig_path, bbox_inches="tight", dpi=300)
+    plt.close(fig)
+    print(f"\nPrediction plot saved to: {fig_path}")
 
-    torch.save(model.state_dict(), model_path)
-    with open(xsc_path, 'wb') as f: pickle.dump(x_scaler, f)
-    with open(ysc_path, 'wb') as f: pickle.dump(y_scaler, f)
-    with open(meta_path, 'wb') as f:
-        pickle.dump({
-            "targets": cfg.TARGETS,
-            "baro_cols": cfg.BARO_COLS,
-            "seq_len": cfg.SEQ_LEN,
-            "kernel_size": cfg.KERNEL_SIZE,
-            "n_blocks": cfg.N_BLOCKS,
-            "hidden_channels": cfg.HIDDEN_CHANNELS,
-            "dropout": cfg.DROPOUT,
-            "receptive_field": rf,
-            "stride": cfg.STRIDE,
-            "pred_offset": cfg.PRED_OFFSET,
-            "add_derivatives": cfg.ADD_DERIVATIVES,
-            "in_channels": cfg.IN_CHANNELS,
-            "use_weighted_loss": cfg.USE_WEIGHTED_LOSS,
-        }, f)
+    calculate_grouped_rmse(y_test, y_pred, TARGET_COLS)
 
-    print(f"\nSaved model: {model_path}")
-    print(f"Saved X scaler: {xsc_path}")
-    print(f"Saved Y scaler: {ysc_path}")
-    print(f"Saved meta: {meta_path}")
+    # Save scalers
+    scaler_path = os.path.join(SAVE_DIR, f"cnn1d_scalers_{version}.pkl")
+    with open(scaler_path, "wb") as f:
+        pickle.dump(
+            {
+                "feature_scaler": feat_scaler,
+                "target_scaler": target_scaler,
+                "config": {
+                    "window_radius": WINDOW_RADIUS,
+                    "baro_cols": BARO_COLS,
+                    "target_cols": TARGET_COLS,
+                },
+            },
+            f,
+        )
+    print(f"Scalers saved to: {scaler_path}")
+
 
 if __name__ == "__main__":
     main()

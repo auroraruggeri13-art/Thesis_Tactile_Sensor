@@ -22,7 +22,7 @@ from typing import Tuple
 import argparse
 
 # If you run without CLI args, set your dataset directories here:
-test_num = 4107
+test_num = 4651
 version_num = 4
 directory_to_datasets = os.path.abspath(fr"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data\test {test_num} - sensor v{version_num}")
 # Create directory if it doesn't exist
@@ -41,13 +41,14 @@ DATASET_DIRS: list[str] = [
 
 # ---------- Tunables ----------
 PAIR_TOL_S = 0.020
-z_limit = 1.0  # mm for 2D Top XY plot filtering
-balls_to_top = -0.041  # meters
-x_shift = 0.029  # meters, PROBE tip offset in Box X direction
+z_limit = 3.0  # mm for 2D Top XY plot filtering
+balls_to_top = -0.049  # meters
+x_shift = 0.024  # meters, PROBE tip offset in Box X direction
+y_shift = 0.0345    # meters, PROBE tip offset in Box Y direction
 
 # --- Tip offset control ---
 USE_FIXED_TIP_OFFSET = True
-FIXED_TIP_OFFSET_IN_PROBE_m = np.array([-0.09, 0.0, -0.025])  # meters
+FIXED_TIP_OFFSET_IN_PROBE_m = np.array([-0.082, 0.0, -0.025])  # meters
 
 # --- ATI mounting (A) relative to PROBE (P) ---
 # If ATI axes are physically aligned with the PROBE axes, keep identity.
@@ -363,7 +364,7 @@ def plot_top_xy(out_dir: str, X: np.ndarray, Y: np.ndarray, Z: np.ndarray, test_
     plt.show()
     print(f"Saved plot: {fig2d_nc_path}")
 
-def plot_top_3d(out_dir: str, X: np.ndarray, Y: np.ndarray, Z: np.ndarray, test_num: int):
+def plot_top_3d(out_dir: str, X: np.ndarray, Y: np.ndarray, Z: np.ndarray, test_num: int, z_limit):
     """Plot 3D tip path in Top frame and save PNG."""
     fig_nc = plt.figure()
     ax_nc = fig_nc.add_subplot(111, projection="3d")
@@ -373,7 +374,7 @@ def plot_top_3d(out_dir: str, X: np.ndarray, Y: np.ndarray, Z: np.ndarray, test_
     z_mm = Z * 1e3
     
     # Keep only points within the requested Top-frame bounds (mm): X [-20,20], Y [-8,8], Z [-2,2]
-    mask = (x_mm >= -20) & (x_mm <= 20) & (y_mm >= -8) & (y_mm <= 8) & (z_mm >= -2) & (z_mm <= 2)
+    mask = (x_mm >= -20) & (x_mm <= 20) & (y_mm >= -8) & (y_mm <= 8) & (z_mm >= -z_limit) & (z_mm <= z_limit)
     
     if np.any(mask):
         # Find continuous segments within the mask
@@ -408,8 +409,9 @@ def plot_top_3d(out_dir: str, X: np.ndarray, Y: np.ndarray, Z: np.ndarray, test_
 def plot_coordinate_systems(out_dir: str,
                             pP_C: np.ndarray, pB_C: np.ndarray, tip_C: np.ndarray,
                             R_C_P: np.ndarray, R_C_B: np.ndarray, R_C_T: np.ndarray,
-                            top_origin_C: np.ndarray, test_num: int):
-    """Plot probe/box/tip coordinate systems in CAMERA frame and save PNG."""
+                            top_origin_C: np.ndarray, ati_origin_C: np.ndarray, R_C_A: np.ndarray,
+                            test_num: int):
+    """Plot probe/box/tip/ATI coordinate systems in CAMERA frame and save PNG."""
     fig_coords = plt.figure(figsize=(10, 8))
     ax_coords = fig_coords.add_subplot(111, projection="3d")
     ax_coords.plot(pP_C[:, 0]*1000, pP_C[:, 1]*1000, pP_C[:, 2]*1000, 'b-', label='Probe Path', alpha=0.5)
@@ -433,11 +435,15 @@ def plot_coordinate_systems(out_dir: str,
     for i, (color, label) in enumerate([('r','Top X'),('g','Top Y'),('b','Top Z')]):
         direction = R_C_T[z_min_idx, :, i] * axis_length
         ax_coords.quiver(origin_T[0], origin_T[1], origin_T[2], direction[0], direction[1], direction[2], color=color, alpha=0.6, label=label)
+    origin_A = ati_origin_C[z_min_idx] * 1000
+    for i, label in enumerate(['ATI X', 'ATI Y', 'ATI Z']):
+        direction = R_C_A[z_min_idx, :, i] * axis_length
+        ax_coords.quiver(origin_A[0], origin_A[1], origin_A[2], direction[0], direction[1], direction[2], color='orange', alpha=0.8, label=label, linewidth=2)
     ax_coords.set_xlabel('Camera X [mm]')
     ax_coords.set_ylabel('Camera Y [mm]')
     ax_coords.set_zlabel('Camera Z [mm]')
     ax_coords.legend()
-    ax_coords.set_title('Probe and Box Coordinate Systems in Camera Frame')
+    ax_coords.set_title('Probe, Box, Top, and ATI Coordinate Systems in Camera Frame')
     coords_path = os.path.join(out_dir, f"coordinate_systems_trial{test_num}.png")
     plt.savefig(coords_path, dpi=220, bbox_inches="tight")
     plt.show()
@@ -509,7 +515,7 @@ def plot_ati_wrenches(out_dir: str, ati_df: pd.DataFrame, test_num: int, frame_l
     filename_suffix = f"_{frame_label.lower().replace(' ', '_')}" if frame_label else ""
     wrench_path = os.path.join(out_dir, f"ati_wrenches{filename_suffix}_trial{test_num}.png")
     plt.savefig(wrench_path, dpi=220, bbox_inches="tight")
-    plt.show()
+    plt.close()
     print(f"Saved ATI wrench plot ({frame_label}): {wrench_path}")
     
 # ---------- Main ----------
@@ -571,7 +577,7 @@ def main(atracsys_path: str, test_num: int):
     # det(R_B_T) = +1
 
     # Top origin offset is given in **Box axes** (face balls are 41 mm below Top)
-    d_T_in_B = np.array([x_shift, balls_to_top, 0.0313], dtype=float)  # meters, in Box axes
+    d_T_in_B = np.array([x_shift, balls_to_top, y_shift], dtype=float)  # meters, in Box axes
 
     # Compose to Camera
     R_C_T = np.matmul(R_C_B, R_B_T)                                   # (N,3,3)
@@ -733,12 +739,15 @@ def main(atracsys_path: str, test_num: int):
         print(f"Skipping force-arrow plot due to error: {e}")
 
     try:
-        plot_top_3d(out_dir, Xp, Yp, Zp, test_num)
+        plot_top_3d(out_dir, Xp, Yp, Zp, test_num, z_limit)
     except Exception as e:
         print(f"Skipping 3D Top plot due to error: {e}")
 
     try:
-        plot_coordinate_systems(out_dir, pP_C, pB_C, tip_C, R_C_P, R_C_B, R_C_T, top_origin_C, test_num)
+        # Extract ATI origin and rotation in Camera frame from transforms
+        ati_origin_C = T_C_A[:, :3, 3]  # (N,3)
+        R_C_A = T_C_A[:, :3, :3]  # (N,3,3)
+        plot_coordinate_systems(out_dir, pP_C, pB_C, tip_C, R_C_P, R_C_B, R_C_T, top_origin_C, ati_origin_C, R_C_A, test_num)
     except Exception as e:
         print(f"Skipping coordinate systems plot due to error: {e}")
 

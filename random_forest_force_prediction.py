@@ -232,65 +232,53 @@ def plot_predictions(y_true, y_pred, target_index=2, target_names=None):
     plt.show()
 
 if __name__ == "__main__":
-    # --- 1. Load and Preprocess Data ---
-    DATA_DIRECTORY = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data" 
-    CSV_FILENAMES = [
-        r"test 4101 - sensor v4\synchronized_events_4101.csv"
-    ]
+    DATA_DIRECTORY = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\train_validation_test_data"
     
-    output_targets = ['x', 'y','fx', 'fy', 'fz']  #, 'tx', 'ty', 'tz'
+    sensor_version = 4.6
 
-    all_dfs = []
+    # Files already created by the previous script
+    TRAIN_FILENAME = f"train_data_v{sensor_version}.csv"
+    TEST_FILENAME   = f"test_data_v{sensor_version}.csv"                       
+    output_targets = ['x', 'y', 'fx', 'fy', 'fz']  # , 'tx', 'ty', 'tz'
+
     # Define the columns you expect to have in the final clean DataFrame
     expected_cols = ['t', 'b1', 'b2', 'b3', 'b4', 'b5', 'b6', 'x', 'y', 'fx', 'fy', 'fz', 'tx', 'ty', 'tz']
 
-    for filename in CSV_FILENAMES:
-        full_path = os.path.join(DATA_DIRECTORY, filename)
-        if not os.path.exists(full_path):
-            print(f"Warning: Data file '{filename}' not found. Skipping.")
-            continue
-            
-        try:
-            # Read CSV 
-            temp_df = pd.read_csv(full_path, skipinitialspace=True)
-            
-            # Clean column names
-            temp_df.columns = temp_df.columns.str.strip()
-            
-            '''# Print column names for debugging
-            print(f"\nFile: {filename}")
-            print("Columns found:", temp_df.columns.tolist())'''
-            
-            
-            # Verify all expected columns are present
-            missing_cols = [col for col in expected_cols if col not in temp_df.columns]
-            if missing_cols:
-                print(f"Warning: Missing columns in {filename}: {missing_cols}")
-                continue
-                
-            all_dfs.append(temp_df)
-                
-        except Exception as e:
-            print(f"Error reading {filename}: {str(e)}")
-            continue
-            
-    if not all_dfs:
-        raise FileNotFoundError("No valid data files found. Please check the data files and their column names.")
+    # ---- Load TRAIN ----
+    train_path = os.path.join(DATA_DIRECTORY, TRAIN_FILENAME)
+    if not os.path.exists(train_path):
+        raise FileNotFoundError(f"Train data file not found: {train_path}")
 
-    df = pd.concat(all_dfs, ignore_index=True)
-    print(f"Successfully combined {len(all_dfs)} files with {len(df)} total data points.")
+    train_df = pd.read_csv(train_path, skipinitialspace=True)
+    train_df.columns = train_df.columns.str.strip()
+
+    missing_cols_train = [col for col in expected_cols if col not in train_df.columns]
+    if missing_cols_train:
+        raise ValueError(f"Train file is missing columns: {missing_cols_train}")
+
+    # ---- Load TEST ----
+    test_path = os.path.join(DATA_DIRECTORY, TEST_FILENAME)
+    if not os.path.exists(test_path):
+        raise FileNotFoundError(f"Test data file not found: {test_path}")
+
+    test_df = pd.read_csv(test_path, skipinitialspace=True)
+    test_df.columns = test_df.columns.str.strip()
+
+    missing_cols_test = [col for col in expected_cols if col not in test_df.columns]
+    if missing_cols_test:
+        raise ValueError(f"Test file is missing columns: {missing_cols_test}")
+
+    print(f"Train samples: {len(train_df)}, Test samples: {len(test_df)}")
 
     INPUT_FEATURES = ['b1', 'b2', 'b3', 'b4', 'b5', 'b6']
     OUTPUT_TARGETS = output_targets
-    
-    X = df[INPUT_FEATURES].values
-    Y = df[OUTPUT_TARGETS].values
 
-    #X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.2, random_state=42)
-    # Use time-based split instead
-    split_index = int(len(df) * 0.8)
-    X_train, X_test = X[:split_index], X[split_index:]
-    y_train, y_test = Y[:split_index], Y[split_index:]
+    # Build numpy arrays for model training
+    X_train = train_df[INPUT_FEATURES].values
+    y_train = train_df[OUTPUT_TARGETS].values
+
+    X_test   = test_df[INPUT_FEATURES].values
+    y_test   = test_df[OUTPUT_TARGETS].values
     
     x_scaler = StandardScaler()
     X_train_scaled = x_scaler.fit_transform(X_train)
@@ -303,10 +291,10 @@ if __name__ == "__main__":
     
     # Define the different hyperparameter sets
     # Params for the position model (more regularized)
-    position_params = {'n_estimators': 100, 'min_samples_leaf': 3, 'max_features': 'sqrt', 'random_state': 42, 'n_jobs': -1}
+    position_params = {'n_estimators': 200, 'min_samples_leaf': 3, 'max_features': 'sqrt', 'random_state': 42, 'n_jobs': -1}
     
     # Params for the force models (less regularized to capture complex signals)
-    force_params = {'n_estimators': 100, 'min_samples_leaf': 1, 'max_features': 1.0, 'random_state': 42, 'n_jobs': -1}
+    force_params = {'n_estimators': 200, 'min_samples_leaf': 1, 'max_features': 1.0, 'random_state': 42, 'n_jobs': -1}
 
     for i, target_name in enumerate(OUTPUT_TARGETS):
         print(f"Training model for target: {target_name}...")
@@ -380,7 +368,7 @@ if __name__ == "__main__":
     os.makedirs(save_dir, exist_ok=True)
     
     # Extract version number from the CSV filename
-    version = CSV_FILENAMES[0].split("sensor ")[1].split("\\")[0]  # This will extract "v4" from the filename
+    version = f'v{sensor_version}'
     
     # Save models and scaler with version
     models_path = os.path.join(save_dir, f'specialized_rf_models_{version}.pkl')

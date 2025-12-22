@@ -7,7 +7,7 @@ from torch.utils.data import TensorDataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
 import matplotlib.pyplot as plt
 import pickle
 
@@ -230,125 +230,134 @@ def plot_all_targets_summary(y_true, y_pred, target_names):
         ax.set_ylim(lims)
     
     plt.tight_layout()
+    plt.show()
     return fig
 
-def calculate_grouped_rmse(y_true, y_pred):
-    """Calculate RMSE for contact location and force vector separately"""
+def calculate_grouped_rmse(y_true, y_pred, target_names):
     
-    # Extract contact location (x, y) - indices 0, 1
-    contact_location_true = y_true[:, :2]
-    contact_location_pred = y_pred[:, :2]
+    print("\n" + "="*70 + "\nGROUPED RMSE METRICS\n" + "="*70)
     
-    # Extract 3-DOF force vector (fx, fy, fz) - indices 2, 3, 4
-    force_vector_true = y_true[:, 2:5]
-    force_vector_pred = y_pred[:, 2:5]
+    # Check for contact location targets
+    contact_indices = [i for i, name in enumerate(target_names) if name in ['x', 'y']]
+    if len(contact_indices) >= 2:
+        contact_location_true = y_true[:, contact_indices]
+        contact_location_pred = y_pred[:, contact_indices]
+        
+        contact_location_errors = contact_location_true - contact_location_pred
+        contact_location_rmse = np.sqrt(np.mean(contact_location_errors ** 2))
+        
+        contact_euclidean_errors = np.sqrt(np.sum(contact_location_errors ** 2, axis=1))
+        contact_euclidean_rmse = np.sqrt(np.mean(contact_euclidean_errors ** 2))
+        
+        print(f"\nContact Location (x, y):")
+        print(f"  - Component-wise RMSE: {contact_location_rmse:.4f} mm")
+        print(f"  - Euclidean RMSE:      {contact_euclidean_rmse:.4f} mm")
+        print(f"  - Mean error distance: {np.mean(contact_euclidean_errors):.4f} mm")
     
-    # Calculate RMSE for contact location
-    contact_location_errors = contact_location_true - contact_location_pred
-    contact_location_rmse = np.sqrt(np.mean(contact_location_errors ** 2))
+    # Check for force targets
+    force_indices = [i for i, name in enumerate(target_names) if name in ['fx', 'fy', 'fz']]
+    if force_indices:
+        force_vector_true = y_true[:, force_indices]
+        force_vector_pred = y_pred[:, force_indices]
+        
+        force_vector_errors = force_vector_true - force_vector_pred
+        force_vector_rmse = np.sqrt(np.mean(force_vector_errors ** 2))
+        
+        force_euclidean_errors = np.sqrt(np.sum(force_vector_errors ** 2, axis=1))
+        force_euclidean_rmse = np.sqrt(np.mean(force_euclidean_errors ** 2))
+        
+        force_names = [target_names[i] for i in force_indices]
+        print(f"\n{len(force_indices)}-DOF Force Vector ({', '.join(force_names)}):")
+        print(f"  - Component-wise RMSE: {force_vector_rmse:.4f} N")
+        print(f"  - Euclidean RMSE:      {force_euclidean_rmse:.4f} N")
+        print(f"  - Mean error magnitude: {np.mean(force_euclidean_errors):.4f} N")
     
-    # Calculate RMSE for 3-DOF force vector
-    force_vector_errors = force_vector_true - force_vector_pred
-    force_vector_rmse = np.sqrt(np.mean(force_vector_errors ** 2))
-    
-    # Calculate Euclidean distance RMSE (error magnitude per sample)
-    contact_euclidean_errors = np.sqrt(np.sum(contact_location_errors ** 2, axis=1))
-    contact_euclidean_rmse = np.sqrt(np.mean(contact_euclidean_errors ** 2))
-    
-    force_euclidean_errors = np.sqrt(np.sum(force_vector_errors ** 2, axis=1))
-    force_euclidean_rmse = np.sqrt(np.mean(force_euclidean_errors ** 2))
-    
-    print("\n" + "="*70)
-    print("GROUPED RMSE METRICS")
-    print("="*70)
-    print(f"\nContact Location (x, y):")
-    print(f"  - Component-wise RMSE: {contact_location_rmse:.4f} mm")
-    print(f"  - Euclidean RMSE:      {contact_euclidean_rmse:.4f} mm")
-    print(f"  - Mean error distance: {np.mean(contact_euclidean_errors):.4f} mm")
-    
-    print(f"\n3-DOF Force Vector (fx, fy, fz):")
-    print(f"  - Component-wise RMSE: {force_vector_rmse:.4f} N")
-    print(f"  - Euclidean RMSE:      {force_euclidean_rmse:.4f} N")
-    print(f"  - Mean error magnitude: {np.mean(force_euclidean_errors):.4f} N")
+    # Check for torque targets
+    torque_indices = [i for i, name in enumerate(target_names) if name in ['tx', 'ty', 'tz']]
+    if torque_indices:
+        torque_vector_true = y_true[:, torque_indices]
+        torque_vector_pred = y_pred[:, torque_indices]
+        
+        torque_vector_errors = torque_vector_true - torque_vector_pred
+        torque_vector_rmse = np.sqrt(np.mean(torque_vector_errors ** 2))
+        
+        torque_euclidean_errors = np.sqrt(np.sum(torque_vector_errors ** 2, axis=1))
+        torque_euclidean_rmse = np.sqrt(np.mean(torque_euclidean_errors ** 2))
+        
+        torque_names = [target_names[i] for i in torque_indices]
+        print(f"\n{len(torque_indices)}-DOF Torque Vector ({', '.join(torque_names)}):")
+        print(f"  - Component-wise RMSE: {torque_vector_rmse*1000:.4f} N·mm")
+        print(f"  - Euclidean RMSE:      {torque_euclidean_rmse*1000:.4f} N·mm")
+        print(f"  - Mean error magnitude: {np.mean(torque_euclidean_errors)*1000:.4f} N·mm")
 
 # Main 
 
 if __name__ == "__main__":
-    # --- 1. Load and Combine Data ---
-    DATA_DIRECTORY = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data" 
-    CSV_FILENAMES = [
-        r"test 4101 - sensor v4\synchronized_events_4101.csv"
-    ]
+    DATA_DIRECTORY = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\train_validation_test_data"
+    
+    sensor_version = 4
 
-    output_targets = ['x', 'y','fx', 'fy', 'fz']  #, 'tx', 'ty', 'tz'
-    all_dfs = []
+    # Files already created by the previous script
+    TRAIN_FILENAME = f"train_data_v{sensor_version}.csv"
+    VAL_FILENAME   = f"validation_data_v{sensor_version}.csv"
+    TEST_FILENAME  = f"test_data_v{sensor_version}.csv"                       
+    output_targets = ['x', 'y', 'fx', 'fy', 'fz']  # , 'tx', 'ty', 'tz'
+
     # Define the columns you expect to have in the final clean DataFrame
     expected_cols = ['t', 'b1', 'b2', 'b3', 'b4', 'b5', 'b6', 'x', 'y', 'fx', 'fy', 'fz', 'tx', 'ty', 'tz']
 
-    for filename in CSV_FILENAMES:
-        full_path = os.path.join(DATA_DIRECTORY, filename)
-        if not os.path.exists(full_path):
-            print(f"Warning: Data file '{filename}' not found. Skipping.")
-            continue
+    # ---- Load TRAIN ----
+    train_path = os.path.join(DATA_DIRECTORY, TRAIN_FILENAME)
+    if not os.path.exists(train_path):
+        raise FileNotFoundError(f"Train data file not found: {train_path}")
 
-        try:
-            # Read CSV with more robust settings
-            temp_df = pd.read_csv(full_path, skipinitialspace=True)
-            
-            # Clean column names
-            temp_df.columns = temp_df.columns.str.strip()
-            
-            # Print column names for debugging
-            print(f"\nFile: {filename}")
-            print("Columns found:", temp_df.columns.tolist())
-            
-            # Verify all expected columns are present
-            missing_cols = [col for col in expected_cols if col not in temp_df.columns]
-            if missing_cols:
-                print(f"Warning: Missing columns in {filename}: {missing_cols}")
-                continue
-                
-        except Exception as e:
-            print(f"Error reading {filename}: {str(e)}")
-            continue
+    train_df = pd.read_csv(train_path, skipinitialspace=True)
+    train_df.columns = train_df.columns.str.strip()
 
-        # Ensure the dataframe contains only the expected columns in the correct order
-        # Remove any extra columns (like time_ns) and keep only the ones we need
-        temp_df = temp_df[expected_cols]
-        
-        all_dfs.append(temp_df)
+    missing_cols_train = [col for col in expected_cols if col not in train_df.columns]
+    if missing_cols_train:
+        raise ValueError(f"Train file is missing columns: {missing_cols_train}")
 
-    if not all_dfs:
-        print("Error: No data files were found. Exiting.")
-        exit()
+    # ---- Load VALIDATION ----
+    val_path = os.path.join(DATA_DIRECTORY, VAL_FILENAME)
+    if not os.path.exists(val_path):
+        raise FileNotFoundError(f"Validation data file not found: {val_path}")
 
-    df = pd.concat(all_dfs, ignore_index=True)
-    
-    print(f"Successfully combined {len(all_dfs)} files into a single dataset with {len(df)} total data points.")
-    
-    #I want to print the whole dataframe
-    print(df)
- 
+    val_df = pd.read_csv(val_path, skipinitialspace=True)
+    val_df.columns = val_df.columns.str.strip()
+
+    missing_cols_val = [col for col in expected_cols if col not in val_df.columns]
+    if missing_cols_val:
+        raise ValueError(f"Validation file is missing columns: {missing_cols_val}")
+
+    # ---- Load TEST ----
+    test_path = os.path.join(DATA_DIRECTORY, TEST_FILENAME)
+    if not os.path.exists(test_path):
+        raise FileNotFoundError(f"Test data file not found: {test_path}")
+
+    test_df = pd.read_csv(test_path, skipinitialspace=True)
+    test_df.columns = test_df.columns.str.strip()
+
+    missing_cols_test = [col for col in expected_cols if col not in test_df.columns]
+    if missing_cols_test:
+        raise ValueError(f"Test file is missing columns: {missing_cols_test}")
+
+    print(f"Train samples: {len(train_df)}, Validation samples: {len(val_df)}, Test samples: {len(test_df)}")
+
     INPUT_FEATURES = ['b1', 'b2', 'b3', 'b4', 'b5', 'b6']
     OUTPUT_TARGETS = output_targets
 
-    X = df[INPUT_FEATURES].values
-    Y = df[OUTPUT_TARGETS].values
+    # Build numpy arrays for model training
+    X_train = train_df[INPUT_FEATURES].values
+    y_train = train_df[OUTPUT_TARGETS].values
 
-    # --- 2. Preprocess Data with PROPER 3-WAY SPLIT ---
-    print("\n" + "="*70)
-    print("SPLITTING DATA INTO TRAIN / VALIDATION / TEST")
-    print("="*70)
-    
-    # doing temporal split: train firts 80%, val next 10%, test last 10%
-    X_train, X_temp, y_train, y_temp = train_test_split(X, Y, test_size=0.40, shuffle=False)
-    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.30, shuffle=False)
+    X_val   = val_df[INPUT_FEATURES].values
+    y_val   = val_df[OUTPUT_TARGETS].values
+
+    X_test  = test_df[INPUT_FEATURES].values
+    y_test  = test_df[OUTPUT_TARGETS].values
 
     
-    print(f"Training set:   {len(X_train)} samples ({len(X_train)/len(X)*100:.1f}%)")
-    print(f"Validation set: {len(X_val)} samples ({len(X_val)/len(X)*100:.1f}%)")
-    print(f"Test set:       {len(X_test)} samples ({len(X_test)/len(X)*100:.1f}%)")
-
     # Scale the data using StandardScaler
     x_scaler = StandardScaler()
     X_train_scaled = x_scaler.fit_transform(X_train)
@@ -358,6 +367,7 @@ if __name__ == "__main__":
     y_scaler = StandardScaler()
     y_train_scaled = y_scaler.fit_transform(y_train)
     y_val_scaled = y_scaler.transform(y_val)
+    y_test_scaled = y_scaler.transform(y_test)
 
     # --- 3. Convert to PyTorch Tensors & Create DataLoaders ---
     X_train_tensor = torch.from_numpy(X_train_scaled).float()
@@ -365,7 +375,7 @@ if __name__ == "__main__":
     X_val_tensor = torch.from_numpy(X_val_scaled).float()
     y_val_tensor = torch.from_numpy(y_val_scaled).float()
     X_test_tensor = torch.from_numpy(X_test_scaled).float()
-    y_test_tensor = torch.from_numpy(y_scaler.transform(y_test)).float()
+    y_test_tensor = torch.from_numpy(y_test_scaled).float()
 
     batch_size = 2048*4
     train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
@@ -392,7 +402,7 @@ if __name__ == "__main__":
     )
     #print(model)
 
-    # Train using VALIDATION set (not test set!)
+    # Train using VALIDATION set for monitoring (not test set!)
     model.learn(train_loader, val_loader, num_epochs=500, y_scaler=y_scaler, early_stopping_patience=100)
 
     # --- 5. Evaluate on TEST SET (never seen during training) ---
@@ -412,7 +422,7 @@ if __name__ == "__main__":
     predictions = y_scaler.inverse_transform(predictions_scaled)
 
     # Calculate grouped RMSE metrics
-    calculate_grouped_rmse(y_test, predictions)
+    calculate_grouped_rmse(y_test, predictions, OUTPUT_TARGETS)
 
     # Create plots
     print("\nGenerating prediction plots...")
@@ -429,72 +439,38 @@ if __name__ == "__main__":
     print("="*70)
     print(comparison_df.head(10).round(2))
 
-    # Per-target metrics for both validation and test sets
+    # Per-target metrics
     print("\n" + "="*70)
-    print("VALIDATION VS TEST SET PERFORMANCE METRICS")
+    print("PER-TARGET PERFORMANCE METRICS (TEST SET)")
     print("="*70)
-    
-    # Get validation set predictions
-    val_predictions_scaled = model.predict(X_val_tensor)
-    val_predictions = y_scaler.inverse_transform(val_predictions_scaled)
-    
-    print("\nValidation Set Metrics:")
-    print("-" * 50)
     for i, target in enumerate(OUTPUT_TARGETS):
-        val_mae = mean_absolute_error(y_val[:, i], val_predictions[:, i])
-        val_r2 = r2_score(y_val[:, i], val_predictions[:, i])
-        val_rmse = np.sqrt(np.mean((y_val[:, i] - val_predictions[:, i])**2))
-        print(f"{target:12s} | MAE: {val_mae:8.4f} | RMSE: {val_rmse:8.4f} | R²: {val_r2:7.4f}")
-    
-    print("\nTest Set Metrics:")
-    print("-" * 50)
-    for i, target in enumerate(OUTPUT_TARGETS):
-        test_mae = mean_absolute_error(y_test[:, i], predictions[:, i])
-        test_r2 = r2_score(y_test[:, i], predictions[:, i])
-        test_rmse = np.sqrt(np.mean((y_test[:, i] - predictions[:, i])**2))
-        print(f"{target:12s} | MAE: {test_mae:8.4f} | RMSE: {test_rmse:8.4f} | R²: {test_r2:7.4f}")
-    
-    # Define save directory for plots
-    save_dir = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\models parameters\NN"
-    
-    # Extract version number from the CSV filename (for plots)
-    version = CSV_FILENAMES[0].split("sensor ")[1].split("\\")[0]
-    
-    # Plot comparison of validation vs test performance
-    plt.figure(figsize=(12, 6))
-    x = np.arange(len(OUTPUT_TARGETS))
-    width = 0.35
-    
-    # Calculate R² scores
-    val_r2_scores = [r2_score(y_val[:, i], val_predictions[:, i]) for i in range(len(OUTPUT_TARGETS))]
-    test_r2_scores = [r2_score(y_test[:, i], predictions[:, i]) for i in range(len(OUTPUT_TARGETS))]
-    
-    plt.bar(x - width/2, val_r2_scores, width, label='Validation R²', alpha=0.8)
-    plt.bar(x + width/2, test_r2_scores, width, label='Test R²', alpha=0.8)
-    
-    plt.xlabel('Output Variables')
-    plt.ylabel('R² Score')
-    plt.title('Validation vs Test Set Performance')
-    plt.xticks(x, OUTPUT_TARGETS, rotation=45)
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    
-    # Save comparison plot with version
-    comparison_fig = plt.gcf()
-    comparison_fig.savefig(os.path.join(save_dir, f'validation_vs_test_comparison_{version}.png'))
-    plt.close()
-
+        mae_target = mean_absolute_error(y_test[:, i], predictions[:, i])
+        rmse_target = np.sqrt(mean_squared_error(y_test[:, i], predictions[:, i]))
+        r2_target = r2_score(y_test[:, i], predictions[:, i])
+        # Add appropriate unit based on the target
+        if target in ['x', 'y']:
+            unit = "mm"
+            scale = 1
+        elif target in ['tx', 'ty', 'tz']:
+            unit = "N·mm"
+            scale = 1000  # Convert from N·m to N·mm
+        else:
+            unit = "N"
+            scale = 1
+        
+        print(f"{target:12s} | MAE: {mae_target*scale:8.4f} {unit} | RMSE: {rmse_target*scale:8.4f} {unit} | R²: {r2_target:7.4f}")
+        
     # --- 6. Save the Model and Scalers ---
     print("\n" + "="*70)
     print("SAVING MODEL AND SCALERS")
     print("="*70)
 
-    # Extract version number from the CSV filename
-    version = CSV_FILENAMES[0].split("sensor ")[1].split("\\")[0]  # This will extract "v2" from the filename
+    # Extract version number from the filename
+    version = f"v{sensor_version}"
     
     # Define save directory
     save_dir = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\models parameters\NN"
+    os.makedirs(save_dir, exist_ok=True)
     
     # Save model and scalers with version
     model_path = os.path.join(save_dir, f'improved_regression_model_{version}.pth')
@@ -512,7 +488,9 @@ if __name__ == "__main__":
     print(f"Y scaler saved to: {y_scaler_path}")
     
     # Save plots to files with version
-    history_fig.savefig(os.path.join(save_dir, f'training_history_{version}.png'))
-    summary_fig.savefig(os.path.join(save_dir, f'predictions_summary_{version}.png'))
+    history_fig.savefig(os.path.join(save_dir, f'training_history_{version}.png'), bbox_inches='tight', dpi=300)
+    summary_fig.savefig(os.path.join(save_dir, f'predictions_summary_{version}.png'), bbox_inches='tight', dpi=300)
+    plt.close('all')
 
-    print("\nTraining complete!")
+    print(f"\nAll plots saved to: {save_dir}")
+    print("Training complete!")

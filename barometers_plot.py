@@ -1,137 +1,97 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Plot six barometer pressures vs time in a single 3x2 subplot figure.
-Run directly from VS Code (no command-line arguments required).
+Plot barometer pressures vs time in a 3x2 subplot figure.
+Optional: if temperature columns exist (e.g., b1_T), plot them on a right axis.
 """
 
 import os
-import re
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.ticker import ScalarFormatter
 
 # ============================================================
 # === USER SETTINGS ==========================================
 # ============================================================
-file_name = "barometers_trial5101.txt"
-test_num = 4105
+test_num = 4304
 version_num = 4
-directory_to_datasets = os.path.abspath(fr"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data\test {test_num} - sensor v{version_num}")
+file_name = f"barometers_trial{test_num}.txt"
+directory_to_datasets = os.path.abspath(
+    fr"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data\test {test_num} - sensor v{version_num}"
+)
 CSV_PATH = os.path.join(directory_to_datasets, file_name)
 
 TITLE = "Barometer Pressures vs Time"
-UNITS = "hPa"        # hectopascals = millibars
-YLIM = None          # e.g. (980, 1020) for typical atmospheric pressure in hPa
+UNITS = "hPa"
+TEMP_UNITS = "°C"
+YLIM = None     # e.g. (980,1020)
 SAVE_FIG = True
 DPI = 200
 # ============================================================
 
-def guess_time_column(df):
-    candidates = [c for c in df.columns if re.search(r"(time|timestamp|ts)", str(c), re.IGNORECASE)]
-    if candidates:
-        return candidates[0]
-    df.insert(0, "time_index", np.arange(len(df), dtype=float))
-    return "time_index"
-
-def to_elapsed_seconds(series):
-    # try datetime first
-    try:
-        dt = pd.to_datetime(series, errors="raise", utc=True)
-        ns = dt.view("int64")
-        return (ns - ns.iloc[0]) / 1e9
-    except Exception:
-        pass
-    # numeric fallback
-    numeric = pd.to_numeric(series, errors="coerce")
-    if numeric.notna().mean() > 0.95:
-        x = numeric.fillna(method="ffill").fillna(method="bfill").to_numpy(dtype=float)
-        if np.isfinite(x[0]): x -= x[0]
-        if np.nanmax(x) - np.nanmin(x) > 1e4:  # probably ms
-            x /= 1000.0
-        return x
-    return np.arange(len(series), dtype=float)
-
-def find_six_barometers(df):
-    # --- normalize column names for reliable matching ---
-    original_cols = list(df.columns)
-    norm = [re.sub(r"\s+", " ", str(c).strip()) for c in original_cols]  # trim & collapse spaces
-    # Build a mapping normalized -> original
-    colmap = {n.lower(): o for n, o in zip(norm, original_cols)}
-
-    wanted = []
-    # Prefer exact "barometer 1..6" (case-insensitive, normalized spaces)
-    for i in range(1, 7):
-        key = f"barometer {i}".lower()
-        if key in colmap:
-            wanted.append(colmap[key])
-
-    # If any are missing, try a broader pattern (p/pressure/baro/dps/sensor + index)
-    if len(wanted) < 6:
-        pattern = re.compile(r"^(?:baro(?:meter)?|pressure|press|p|sensor|dps)\s*([0-9]+)$", re.IGNORECASE)
-        candidates = []
-        for n, o in zip(norm, original_cols):
-            m = pattern.search(n)
-            if m:
-                idx = int(m.group(1))
-                if 0 <= idx <= 99:
-                    candidates.append((idx, o))
-        # sort by numeric index and add any not already included
-        for _, o in sorted(candidates, key=lambda x: x[0]):
-            if o not in wanted:
-                wanted.append(o)
-        wanted = wanted[:6]
-
-    if len(wanted) != 6:
-        raise ValueError(
-            f"Could not find six barometer columns. Found: {wanted}. "
-            "Make sure your CSV has columns like 'barometer 1'...'barometer 6', "
-            "or adjust 'find_six_barometers' to your naming."
-        )
-    return wanted
-
-# ============================================================
-# === MAIN PLOTTING SECTION =================================
-# ============================================================
-
+# Load file (auto-detect delimiter)
 df = pd.read_csv(CSV_PATH, sep=None, engine="python")
 
-time_col = guess_time_column(df)
-t = to_elapsed_seconds(df[time_col])
-pres_cols = find_six_barometers(df)
+# Time handling (use Epoch_s → convert to elapsed seconds)
+if "Epoch_s" not in df.columns:
+    raise ValueError("File has no 'Epoch_s' column — cannot extract time.")
 
-print(f"Detected time column: {time_col}")
-print(f"Detected pressure columns: {pres_cols}")
+t = df["Epoch_s"].astype(float).to_numpy()
+t = t - t[0]     # convert to elapsed seconds
 
+# Pressure columns (detect both old: b1..b6 and new: b1_P..b6_P)
+pressure_cols = []
+temp_cols = {}
+
+for i in range(1, 7):
+    # Pressure
+    if f"b{i}" in df.columns:
+        pressure_cols.append(f"b{i}")
+    elif f"b{i}_P" in df.columns:
+        pressure_cols.append(f"b{i}_P")
+    else:
+        raise ValueError(f"No pressure column found for sensor b{i}")
+
+    # Temperature (optional)
+    if f"b{i}_T" in df.columns:
+        temp_cols[pressure_cols[-1]] = f"b{i}_T"
+
+# Create plot
 fig, axes = plt.subplots(3, 2, figsize=(12, 8), sharex=True)
 axes = axes.ravel()
 
-for i, col in enumerate(pres_cols):
-    # Convert raw values to actual pressure values
-    y_raw = pd.to_numeric(df[col], errors="coerce").to_numpy()
-    y = y_raw  # Use actual values without scaling
-    
+for i, col in enumerate(pressure_cols):
+    y = pd.to_numeric(df[col], errors="coerce").to_numpy()
+
     ax = axes[i]
-    ax.plot(t, y, linewidth=1.0)
+    ax.plot(t, y, linewidth=1.0, label="Pressure")
+    ax.set_ylabel(f"{col} [{UNITS}]")
+    ax.grid(True, alpha=0.3)
     
-    # Just show sensor name and units
-    ax.set_ylabel(f"{col}\n[{UNITS}]")
-    
+    # Format y-axis to show plain numbers instead of scientific notation
+    ax.yaxis.set_major_formatter(ScalarFormatter(useOffset=False))
+    ax.ticklabel_format(style='plain', axis='y')
+
+    # Apply y-limits if defined
     if YLIM:
         ax.set_ylim(*YLIM)
-    
-    # Show actual values on y-axis without any formatting
-    ax.yaxis.set_major_formatter(plt.ScalarFormatter())
-    ax.yaxis.get_major_formatter().set_useOffset(False)  # Prevent offset notation
-    ax.yaxis.get_major_formatter().set_scientific(False)  # Prevent scientific notation
-    
-    # Add grid for better readability
-    ax.grid(True, alpha=0.3)
+
+    # === Optional temperature plot on right axis ===
+    if col in temp_cols:
+        temp_col = temp_cols[col]
+        temp_y = pd.to_numeric(df[temp_col], errors="coerce").to_numpy()
+        ax2 = ax.twinx()
+        ax2.plot(t, temp_y, color="tab:red", linewidth=0.5, alpha=0.8, label="Temperature")
+        ax2.set_ylabel(f"{temp_col} [{TEMP_UNITS}]", color="tab:red")
+        ax2.tick_params(axis='y', labelcolor="tab:red")
+        ax2.set_ylim(23, 25)
 
 axes[-2].set_xlabel("Time [s]")
 axes[-1].set_xlabel("Time [s]")
-fig.suptitle(TITLE, y=0.98)
-fig.tight_layout(rect=[0, 0, 1, 0.97])
+
+fig.suptitle(TITLE)
+fig.tight_layout()
 
 if SAVE_FIG:
     out_path = os.path.splitext(CSV_PATH)[0] + "_6subplots.png"
