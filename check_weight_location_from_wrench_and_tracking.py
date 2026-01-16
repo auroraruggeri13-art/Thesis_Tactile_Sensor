@@ -22,8 +22,8 @@ from typing import Tuple
 import argparse
 
 # If you run without CLI args, set your dataset directories here:
-test_num = 4651
-version_num = 4
+test_num = 1200
+version_num = 1
 directory_to_datasets = os.path.abspath(fr"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data\test {test_num} - sensor v{version_num}")
 # Create directory if it doesn't exist
 if not os.path.exists(directory_to_datasets):

@@ -234,7 +234,7 @@ def plot_predictions(y_true, y_pred, target_index=2, target_names=None):
 if __name__ == "__main__":
     DATA_DIRECTORY = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\train_validation_test_data"
     
-    sensor_version = 4.6
+    sensor_version = 5.7
 
     # Files already created by the previous script
     TRAIN_FILENAME = f"train_data_v{sensor_version}.csv"

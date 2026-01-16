@@ -30,7 +30,7 @@ from sklearn.ensemble import RandomForestRegressor
 # ============================================================
 
 DATA_DIRECTORY = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\train_validation_test_data"
-sensor_version = 4.6
+sensor_version = 5.9
 TRAIN_FILENAME = f"train_data_v{sensor_version}.csv"
 TEST_FILENAME  = f"test_data_v{sensor_version}.csv"
 
@@ -593,10 +593,12 @@ def main():
     print("\n" + "="*70 + "\nSAVING MODELS AND PLOTS\n" + "="*70)
 
     save_dir = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\models parameters\averaged models"
+    save_dir_comparison = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\models parameters\averaged models\comparison_plots"
     os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(save_dir_comparison, exist_ok=True)
 
-    version = f'v{sensor_version:.1f}'
-
+    version = f'v{sensor_version:.2f}'
+    
     # Save scaler
     scaler_path = os.path.join(save_dir, f'scaler_sliding_window_{version}.pkl')
     with open(scaler_path, 'wb') as f:
@@ -615,29 +617,29 @@ def main():
     fig_baro = plot_barometer_with_derivatives(train_df, BARO_COLS[0], title_suffix="(train set)")
     fig_baro.savefig(os.path.join(save_dir, f'sliding_window_barometer_{version}.png'),
                      bbox_inches='tight', dpi=300)
-    plt.close(fig_baro)
+    plt.close()
 
     # 2) Loss curves
     for model_name, loss_hist in loss_histories.items():
         fig_loss = plot_loss_curves(loss_hist, model_name, TARGET_COLS)
         fig_loss.savefig(os.path.join(save_dir, f'loss_curve_{model_name.lower()}_{version}.png'),
                          bbox_inches='tight', dpi=300)
-        plt.close(fig_loss)
+        plt.show()
         print(f"{model_name} loss curve saved.")
 
     # 3) Pred vs actual for all models
     for model_name, y_hat in y_preds.items():
         fig = plot_pred_vs_actual(y_test, y_hat, TARGET_COLS, title_suffix=model_name)
-        fig.savefig(os.path.join(save_dir, f'sliding_window_predictions_{model_name.lower()}_{version}.png'),
-                    bbox_inches='tight', dpi=300)
-        plt.close(fig)
+        fig.savefig(os.path.join(save_dir, f'sliding_window_predictions_{model_name.lower()}_{version}.png'), bbox_inches='tight', dpi=300)
+        plt.show()
+        fig.savefig(os.path.join(save_dir_comparison, f'actual_vs_prediction_{model_name.lower()}_{version}.png'), bbox_inches='tight', dpi=300)
         print(f"{model_name} prediction plot saved.")
 
         # 4) Error distribution plots
         fig_err = plot_error_distributions(y_test, y_hat, TARGET_COLS, title_suffix=model_name)
         fig_err.savefig(os.path.join(save_dir, f'error_distribution_{model_name.lower()}_{version}.png'),
                         bbox_inches='tight', dpi=300)
-        plt.close(fig_err)
+        plt.close()
         print(f"{model_name} error distribution plot saved.")
 
         calculate_grouped_rmse(y_test, y_hat, TARGET_COLS, title_suffix=f"({model_name} - All Data)")
@@ -647,20 +649,25 @@ def main():
         lgbm_models = models["LightGBM"]
         try:
             import graphviz
+            print("\nGenerating LightGBM tree visualizations...")
             for i, target in enumerate(TARGET_COLS):
                 fig, ax = plt.subplots(figsize=(20, 10))
                 lgb.plot_tree(lgbm_models[i].booster_, tree_index=0, ax=ax, show_info=['split_gain'])
                 plt.title(f'LightGBM Decision Tree (Target: {target}, Tree Index: 0)', fontsize=14)
                 plt.tight_layout()
-                fig.savefig(os.path.join(save_dir, f'lightgbm_tree_{target}_{version}.png'),
-                            bbox_inches='tight', dpi=300)
+                tree_path = os.path.join(save_dir, f'lightgbm_tree_{target}_{version}.png')
+                fig.savefig(tree_path, bbox_inches='tight', dpi=300)
                 plt.close(fig)
+                print(f"  Saved tree for {target}: {tree_path}")
             print("LightGBM tree visualizations saved.")
-        except ImportError:
-            print("Warning: graphviz not installed. Skipping tree visualization.")
+        except ImportError as ie:
+            print(f"Warning: graphviz not installed. Skipping tree visualization.")
+            print(f"  Error details: {ie}")
             print("Tip: Install graphviz to enable tree visualization: conda install python-graphviz")
         except Exception as e:
             print(f"Warning: Could not generate LightGBM tree plots. Error: {e}")
+            import traceback
+            traceback.print_exc()
             print("Tree visualization skipped.")
 
         # # Constrained region: 20 x 16 mm centered at origin

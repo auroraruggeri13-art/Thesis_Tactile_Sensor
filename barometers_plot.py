@@ -14,9 +14,9 @@ from matplotlib.ticker import ScalarFormatter
 # ============================================================
 # === USER SETTINGS ==========================================
 # ============================================================
-test_num = 4304
+test_num = 4900
 version_num = 4
-file_name = f"barometers_trial{test_num}.txt"
+file_name = f"{test_num}barometers_trial.txt" # or f"barometers_trial{test_num}.txt"
 directory_to_datasets = os.path.abspath(
     fr"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data\test {test_num} - sensor v{version_num}"
 )
@@ -85,7 +85,7 @@ for i, col in enumerate(pressure_cols):
         ax2.plot(t, temp_y, color="tab:red", linewidth=0.5, alpha=0.8, label="Temperature")
         ax2.set_ylabel(f"{temp_col} [{TEMP_UNITS}]", color="tab:red")
         ax2.tick_params(axis='y', labelcolor="tab:red")
-        ax2.set_ylim(23, 25)
+        ax2.set_ylim(24, 25)
 
 axes[-2].set_xlabel("Time [s]")
 axes[-1].set_xlabel("Time [s]")

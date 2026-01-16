@@ -39,7 +39,7 @@ else:
 # ============================================================
 
 DATA_DIRECTORY = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\train_validation_test_data"
-sensor_version = 4.6
+sensor_version = 5.7
 TRAIN_FILENAME = f"train_data_v{sensor_version}.csv"
 VALIDATION_FILENAME = f"validation_data_v{sensor_version}.csv"
 TEST_FILENAME  = f"test_data_v{sensor_version}.csv"

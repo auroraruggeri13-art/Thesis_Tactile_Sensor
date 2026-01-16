@@ -55,7 +55,7 @@ def calculate_grouped_rmse(y_true, y_pred):
 if __name__ == "__main__":
     DATA_DIRECTORY = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\train_validation_test_data"
     
-    sensor_version = 4
+    sensor_version = 5.9
 
     # Files already created by the previous script
     TRAIN_FILENAME = f"train_data_v{sensor_version}.csv"
