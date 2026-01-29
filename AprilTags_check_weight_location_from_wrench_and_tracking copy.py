@@ -24,7 +24,7 @@ from scipy import signal
 # =========================
 # Inputs / settings (edit here)
 # =========================
-TEST_NUM = 5903
+TEST_NUM = 51036
 VERSION_NUM = 5
 BOX_TAG_ID = 1
 
@@ -39,9 +39,9 @@ PAIR_TOL_S = 0.020
 Z_LIMIT_MM_2D = 10.0
 
 # Top origin offset in Box axes (meters)
-Z_SHIFT = 90 / 1000
-X_SHIFT = -10 / 1000 
-Y_SHIFT = 99 / 1000
+Z_SHIFT = 98 / 1000
+X_SHIFT = 3 / 1000 
+Y_SHIFT = 69 / 1000
 
 # Box->Top rotation (matrix)
 R_B_T = np.array([
@@ -51,7 +51,7 @@ R_B_T = np.array([
 ], dtype=float).T
 
 # Tip offset in PROBE frame (meters)
-TIP_OFFSET_IN_PROBE_M = np.array([0.0, -0.01, -0.06], dtype=float)
+TIP_OFFSET_IN_PROBE_M = np.array([0.0, 0.01, -0.060], dtype=float) #-0.060
 
 # ATI mounting (ATI frame aligned with PROBE frame)
 R_P_A = np.eye(3)
@@ -66,11 +66,11 @@ SMOOTH_METHOD = "savgol"     # "butter" | "savgol" | "none"
 BUTTER_CUTOFF_HZ = 8.0
 BUTTER_ORDER = 4
 SAVGOL_WINDOW_S = 9 / 60       # ~0.1 to 0.25 s typical
-SAVGOL_POLYORDER = 3
+SAVGOL_POLYORDER = 0
 
 # In plane rotation correction
 CORRECT_INPLANE_ROTATION = True
-MANUAL_ROTATION_ANGLE_DEG = 0 # None = auto (PCA)
+MANUAL_ROTATION_ANGLE_DEG = 5 # None = auto (PCA)
 
 # =========================
 # Loading
@@ -205,6 +205,81 @@ def wrench_A_to_T(R_TA: np.ndarray, p_A_in_T: np.ndarray, F_A: np.ndarray, M_A: 
     M_rot = np.einsum("nij,nj->ni", R_TA, M_A)
     M_T = M_rot + np.cross(p_A_in_T, F_T)
     return F_T, M_T
+
+def stabilize_box_orientation(R_C_B: np.ndarray) -> np.ndarray:
+    """
+    Stabilize box orientation by fixing orientation discontinuities.
+    Uses the first orientation as reference and ensures all subsequent
+    orientations are in the same hemisphere (dot product > 0).
+    """
+    N = len(R_C_B)
+    R_stable = R_C_B.copy()
+    
+    # Use median orientation as reference (more robust than first frame)
+    # Convert to quaternions for easier comparison
+    def rotm_to_quat(R):
+        """Convert rotation matrix to quaternion (w, x, y, z)"""
+        trace = np.trace(R)
+        if trace > 0:
+            s = 0.5 / np.sqrt(trace + 1.0)
+            w = 0.25 / s
+            x = (R[2,1] - R[1,2]) * s
+            y = (R[0,2] - R[2,0]) * s
+            z = (R[1,0] - R[0,1]) * s
+        else:
+            if R[0,0] > R[1,1] and R[0,0] > R[2,2]:
+                s = 2.0 * np.sqrt(1.0 + R[0,0] - R[1,1] - R[2,2])
+                w = (R[2,1] - R[1,2]) / s
+                x = 0.25 * s
+                y = (R[0,1] + R[1,0]) / s
+                z = (R[0,2] + R[2,0]) / s
+            elif R[1,1] > R[2,2]:
+                s = 2.0 * np.sqrt(1.0 + R[1,1] - R[0,0] - R[2,2])
+                w = (R[0,2] - R[2,0]) / s
+                x = (R[0,1] + R[1,0]) / s
+                y = 0.25 * s
+                z = (R[1,2] + R[2,1]) / s
+            else:
+                s = 2.0 * np.sqrt(1.0 + R[2,2] - R[0,0] - R[1,1])
+                w = (R[1,0] - R[0,1]) / s
+                x = (R[0,2] + R[2,0]) / s
+                y = (R[1,2] + R[2,1]) / s
+                z = 0.25 * s
+        return np.array([w, x, y, z])
+    
+    def quat_to_rotm(q):
+        """Convert quaternion (w, x, y, z) to rotation matrix"""
+        w, x, y, z = q
+        return np.array([
+            [1-2*(y*y+z*z), 2*(x*y-w*z), 2*(x*z+w*y)],
+            [2*(x*y+w*z), 1-2*(x*x+z*z), 2*(y*z-w*x)],
+            [2*(x*z-w*y), 2*(y*z+w*x), 1-2*(x*x+y*y)]
+        ])
+    
+    # Convert all to quaternions
+    quats = np.array([rotm_to_quat(R_C_B[i]) for i in range(N)])
+    
+    # Use first quaternion as reference
+    q_ref = quats[0]
+    
+    # Fix sign flips: if dot product with reference is negative, flip the quaternion
+    for i in range(N):
+        if np.dot(quats[i], q_ref) < 0:
+            quats[i] = -quats[i]
+    
+    # Average the quaternions (simple mean, since they're now all in same hemisphere)
+    q_mean = np.mean(quats, axis=0)
+    q_mean = q_mean / np.linalg.norm(q_mean)  # Renormalize
+    
+    # Use this fixed orientation for all frames
+    R_fixed = quat_to_rotm(q_mean)
+    
+    for i in range(N):
+        R_stable[i] = R_fixed
+    
+    print(f"Box orientation stabilized: using averaged orientation from all {N} frames")
+    
+    return R_stable
 
 # =========================
 # Plotting (unchanged legends)
@@ -456,6 +531,9 @@ def main(atracsys_path: str, test_num: int):
     pB_C = F[["bpx","bpy","bpz"]].to_numpy()
     R_C_P = np.stack(F["PR"].to_numpy())
     R_C_B = np.stack(F["BR"].to_numpy())
+    
+    # Stabilize box orientation to fix tracking discontinuities
+    R_C_B = stabilize_box_orientation(R_C_B)
 
     # Tip in camera: tip_C = pP_C + R_C_P @ tip_offset_in_probe
     tip_C = pP_C + np.einsum("nij,j->ni", R_C_P, TIP_OFFSET_IN_PROBE_M)

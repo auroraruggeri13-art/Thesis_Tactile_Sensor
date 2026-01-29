@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Barometer-Force Data Synchronization and Processing
+Barometer-Force Data Synchronization and Processing - UPDATED VERSION
+
+NEW FEATURES:
+- Two drift removal methods: EMA and Linear Temperature Compensation
+- Fixed zeroing logic (works correctly after warmup removal)
+- Comparison plots to evaluate methods
+- Real-time compatible algorithms
 
 Steps:
 1) Load processing_test CSV (ROS/epoch seconds in 'time', positions, forces)
-2) Load barometer CSV/TXT (new format: Epoch_s + b1..b6, or legacy datalog_*.csv)
-3) Remove initial warm-up period (optional)
-4) Apply drift removal (time-based or temperature-based)
+2) Load barometer CSV/TXT (new format: Epoch_s + b1..b6, t1..t6)
+3) Remove initial warm-up period to eliminate sensor startup shift
+4) Apply drift removal (choose method in config)
 5) Synchronize with merge_asof (nearest, tolerance)
-6) Zero barometers at baseline
-7) Dynamic re-zeroing when Fz ≈ 0 (optional)
-8) Remove outliers (optional)
-9) Apply spatial mask (keep only rows within bounds)
-10) Generate plots and save synchronized CSV
+6) Zero barometers at baseline (fixed implementation)
+7) Apply spatial mask (keep only rows within bounds)
+8) Generate plots and save synchronized CSV
 
-Author: Aurora Ruggeri
+Author: Aurora Ruggeri (updated with Claude's improvements)
 """
 
 import os
@@ -26,57 +30,77 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
+try:
+    import ruptures as rpt
+    RUPTURES_AVAILABLE = True
+except ImportError:
+    RUPTURES_AVAILABLE = False
+    print("WARNING: ruptures library not found. Install with: pip install ruptures")
+    print("Step removal will be disabled.")
+
+# Import new drift removal functions
+from barometer_drift_removal import (
+    remove_drift_ema,
+    remove_drift_temperature_linear,
+    zero_barometers_fixed,
+    plot_drift_comparison,
+    plot_temperature_vs_pressure,
+    remove_steps_robust
+)
+
 # =========================== CONFIGURATION ===========================
 
-TEST_NUM = 4700
-VERSION_NUM = 4
+# Process multiple test numbers (single value or list)
+TEST_NUMS = [51036]  
+# [51000, 51001, 51002, 51003, 51004, 51005, 51006, 51007, 51008, 51100, 51101, 51102, 51103, 51104, 51105, 51106, 51200, 51201, 51202, 51203, 51204, 51205]
+# [51300, 51301, 51302, 51303, 51304, 51400, 51401, 51402, 51403, 51404, 51405, 51500, 51501, 51502, 51503]
+# [2, 3, 4, 5]  
+VERSION_NUM = 5
 
 BASE_DIR = Path(r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data")
-DATA_DIR = BASE_DIR / f"test {TEST_NUM} - sensor v{VERSION_NUM}"
-
-# Input files
-PROCESSING_FILE = DATA_DIR / f"processing_test_{TEST_NUM}.csv"
-BAROMETER_FILE = DATA_DIR / f"{TEST_NUM}barometers_trial.txt"
-
-# Output
-OUTPUT_FILE = DATA_DIR / f"synchronized_events_{TEST_NUM}.csv"
-save_plots_dir = DATA_DIR / "plots synchronized"
-save_plots_dir.mkdir(exist_ok=True, parents=True)
 
 # --- Synchronization params ---
 ASOF_DIRECTION = "nearest"
 ASOF_TOLERANCE_S = 0.05  # seconds
 
-# --- Initial baseline zeroing ---
-BASELINE_METHOD = 'auto'  # Options: 'auto', 'fixed', 'zero_fz'
-                          # 'auto' = automatically find most stable period
-                          # 'fixed' = use fixed time window (after warmup)
-                          # 'zero_fz' = use periods where Fz ≈ 0
-BASELINE_DURATION_S = 2  # seconds for baseline window
-BASELINE_WARMUP_S = 2.0  # For 'fixed' method: skip first N seconds before baseline
-BASELINE_FZ_THRESHOLD = 0.1  # For 'zero_fz' method: |Fz| threshold [N]
-
 # --- Remove initial warm-up data ---
-REMOVE_INITIAL_WARMUP_DURATION = 0.5  # seconds to remove from the beginning (0 = disabled)
+REMOVE_INITIAL_WARMUP_DURATION = 0.1  # seconds to remove from the beginning (0 = disabled)
 
-# --- Drift removal method ---
-# Options: 'time', 'temperature', or None
-DRIFT_REMOVAL_METHOD = 'temperature'  # 'time' = polynomial detrending vs time
-                                       # 'temperature' = temperature-based correction
-                                       # None = no drift removal
-DRIFT_POLY_ORDER = 2                   # Polynomial order for drift fitting (1=linear, 2=quadratic)
-DRIFT_SKIP_INITIAL_FRACTION = 0.05     # Fraction of data to skip when fitting drift (avoid warm-up)
+# --- Step detection & leveling (removes hardware jumps before drift removal) ---
+ENABLE_STEP_LEVELING = True             # Enable step detection and leveling
+STEP_THRESHOLD_HPA = 15.0                 # Jump size (hPa) to consider a step
+STEP_WINDOW_SIZE = 10                    # Window size for median calculation
+
+# --- Drift removal method selection ---
+DRIFT_REMOVAL_METHOD = "ema"  # Options: "ema", "temperature", "both", "none"
+
+# EMA parameters (for method='ema' or 'both')
+EMA_ALPHA = 0.0001  # Smoothing factor (smaller = removes more drift)
+                   # Time constant ≈ 1/alpha samples
+                   # At 100Hz: 0.001 → ~10s, 0.0001 → ~100s
+
+# Sensor-specific alpha overrides (for sensors with different drift characteristics)
+EMA_ALPHA_OVERRIDE = {
+    # 'b6': 0.005,  # b6 has faster drift, needs larger alpha
+    # 'b3': 0.002,  # Example: uncomment if b3 also needs adjustment
+}
+
+# Temperature compensation parameters (for method='temperature' or 'both')
+TEMP_SKIP_INITIAL_FRACTION = 0.05  # Fraction of data to skip when fitting
+
+# Zeroing parameters
+ZERO_AT_START = True  # Zero the data after drift removal
 
 # --- Dynamic re-zero based on Fz ≈ 0 ---
-ENABLE_DYNAMIC_REZERO_ON_ZERO_FZ = True  # Set False to disable
+ENABLE_DYNAMIC_REZERO_ON_ZERO_FZ = True  # Set True to enable
 FZ_ZERO_THRESHOLD = 0.2                   # |Fz| [N] considered "zero"
 MIN_ZERO_DURATION_S = 0.01                # Minimum duration of zero-force interval
 MIN_ZERO_SAMPLES = 5                      # Minimum number of samples in that interval
 
-# --- Barometer outlier removal ---
-REMOVE_BAROMETER_OUTLIERS = True  # Set False to disable outlier removal
-OUTLIER_METHOD = 'iqr'            # 'iqr' or 'zscore'
-OUTLIER_THRESHOLD = 10            # IQR multiplier (3.0) or Z-score threshold (3.0)
+# --- No-contact masking for training data (NEW) ---
+ENABLE_NO_CONTACT_MASKING = True          # Teach model to recognize no-contact states
+NO_CONTACT_FZ_THRESHOLD = 0.1             # |fz| < this value triggers masking
+NO_CONTACT_SENTINEL = -999.0              # Sentinel value for "no prediction" (converted to NaN in training)
 
 # --- Spatial masking ---
 SPATIAL_FILTER = {
@@ -94,6 +118,52 @@ PATH_BREAK_ON_XY_JUMPS = False         # Enable/disable XY jump detection
 PATH_JUMP_FACTOR = 20.0                # XY jump factor for trajectory segmentation
 
 # =============================== HELPERS ===============================
+
+def mask_no_contact_samples(df: pd.DataFrame, fz_threshold: float = 0.1, 
+                            sentinel: float = -999.0) -> pd.DataFrame:
+    """
+    Teach the model to recognize no-contact states by masking targets.
+    
+    When |fz| < threshold, set x, y, fx, fy to sentinel value (-999).
+    This teaches the model to predict 'no contact' based on barometer patterns.
+    
+    The sentinel value will be converted to NaN in training scripts for proper handling.
+    
+    Args:
+        df: DataFrame with columns 'fz', 'x', 'y', 'fx', 'fy'
+        fz_threshold: Threshold for considering force as zero (N)
+        sentinel: Sentinel value to use for masked outputs
+    
+    Returns:
+        DataFrame with masked values
+    """
+    df = df.copy()
+    
+    # Find no-contact samples
+    if 'fz' in df.columns:
+        no_contact_mask = df['fz'].abs() < fz_threshold
+        n_masked = no_contact_mask.sum()
+        
+        if n_masked > 0:
+            # Set positions and lateral forces to sentinel value
+            if 'x' in df.columns:
+                df.loc[no_contact_mask, 'x'] = sentinel
+            if 'y' in df.columns:
+                df.loc[no_contact_mask, 'y'] = sentinel
+            if 'fx' in df.columns:
+                df.loc[no_contact_mask, 'fx'] = sentinel
+            if 'fy' in df.columns:
+                df.loc[no_contact_mask, 'fy'] = sentinel
+            
+            pct_masked = 100 * n_masked / len(df)
+            print(f"\nNo-contact masking applied:")
+            print(f"  Threshold: |fz| < {fz_threshold} N")
+            print(f"  Masked samples: {n_masked}/{len(df)} ({pct_masked:.1f}%)")
+            print(f"  Set x, y, fx, fy to {sentinel} (will be NaN in training)")
+            print(f"  This teaches the model to recognize no-contact barometer patterns")
+    
+    return df
+
 
 def ensure_seconds(series: pd.Series) -> pd.Series:
     """
@@ -278,438 +348,6 @@ def apply_spatial_filter(df: pd.DataFrame) -> pd.DataFrame:
         df['z_position_mm'].between(z_min, z_max)
     )
     return df.loc[mask].copy()
-
-
-def zero_barometers(df, method='auto', baseline_duration=2.0, warmup_s=0.0,
-                   fz_threshold=0.1, save_diagnostic_plot=None):
-    """
-    Subtract the mean of the baseline period from each barometer.
-
-    Parameters:
-    -----------
-    method : str
-        'auto' = automatically find most stable period (recommended for offline)
-        'fixed' = use fixed time window after warmup (for real-time)
-        'zero_fz' = use periods where |Fz| < fz_threshold
-    baseline_duration : float
-        Duration in seconds for baseline window
-    warmup_s : float
-        For 'fixed' method: skip first N seconds before baseline
-    fz_threshold : float
-        For 'zero_fz' method: |Fz| threshold [N] for zero-force periods
-    save_diagnostic_plot : str or None
-        If provided, save diagnostic plot to this path
-    """
-    df = df.copy()
-
-    baro_cols = [c for c in df.columns if c.lower().startswith("b") and len(c) == 2 and c[1].isdigit()]
-    if not baro_cols:
-        print("zero_barometers: No barometer columns found.")
-        return df
-
-    t = df["time"].to_numpy()
-    t0 = t[0]
-
-    # === METHOD 1: AUTO - Find most stable period ===
-    if method == 'auto':
-        print(f"\n[Method: AUTO] Finding most stable {baseline_duration}s period:")
-
-        # Calculate window size in samples
-        total_duration = t[-1] - t[0]
-        window_samples = int(baseline_duration * len(t) / total_duration)
-        window_samples = max(window_samples, 10)  # At least 10 samples
-
-        # Scan through data to find lowest variance window
-        best_start_idx = 0
-        min_total_variance = float('inf')
-        variance_profile = []  # For diagnostic plotting
-
-        step_size = max(1, window_samples // 4)
-        scan_indices = []
-
-        for start_idx in range(0, len(df) - window_samples, step_size):
-            end_idx = start_idx + window_samples
-            window_variance = sum(df[c].iloc[start_idx:end_idx].var() for c in baro_cols)
-
-            variance_profile.append(window_variance)
-            scan_indices.append(start_idx)
-
-            if window_variance < min_total_variance:
-                min_total_variance = window_variance
-                best_start_idx = start_idx
-
-        best_end_idx = best_start_idx + window_samples
-        mask = df.index.isin(range(best_start_idx, best_end_idx))
-        t_start = t[best_start_idx]
-        t_end = t[best_end_idx - 1]
-
-        print(f"  ✓ Most stable period: t={t_start:.3f}-{t_end:.3f}s (indices {best_start_idx}-{best_end_idx})")
-        print(f"    Total variance: {min_total_variance:.4f}")
-
-        # Create diagnostic plot if requested
-        if save_diagnostic_plot:
-            _plot_baseline_diagnostics(df, t, scan_indices, variance_profile,
-                                      best_start_idx, window_samples,
-                                      baro_cols, save_diagnostic_plot)
-
-    # === METHOD 2: FIXED - Use time window after warmup ===
-    elif method == 'fixed':
-        t_start = t0 + warmup_s
-        t_end = t_start + baseline_duration
-        mask = (df["time"] >= t_start) & (df["time"] <= t_end)
-
-        if warmup_s > 0:
-            print(f"\n[Method: FIXED] Using t={warmup_s:.1f}-{warmup_s+baseline_duration:.1f}s")
-            print(f"  (skipping first {warmup_s}s warmup)")
-        else:
-            print(f"\n[Method: FIXED] Using first {baseline_duration}s")
-
-        n_samples = mask.sum()
-        print(f"  Baseline samples: {n_samples}")
-
-    # === METHOD 3: ZERO_FZ - Use zero-force periods ===
-    elif method == 'zero_fz':
-        fz_col = _force_name(df, "Fz")
-        if not fz_col:
-            print("\n[Method: ZERO_FZ] WARNING: No Fz column found. Falling back to 'fixed' method.")
-            return zero_barometers(df, method='fixed', baseline_duration=baseline_duration,
-                                  warmup_s=warmup_s, save_diagnostic_plot=save_diagnostic_plot)
-
-        print(f"\n[Method: ZERO_FZ] Finding baseline from zero-force periods (|Fz| < {fz_threshold}N):")
-
-        fz = pd.to_numeric(df[fz_col], errors="coerce").to_numpy()
-        zero_fz_mask = np.isfinite(fz) & (np.abs(fz) <= fz_threshold)
-
-        if not np.any(zero_fz_mask):
-            print(f"  WARNING: No periods with |Fz| < {fz_threshold}N found. Falling back to 'fixed' method.")
-            return zero_barometers(df, method='fixed', baseline_duration=baseline_duration,
-                                  warmup_s=warmup_s, save_diagnostic_plot=save_diagnostic_plot)
-
-        # Find contiguous zero-force segments
-        segments = []
-        in_seg = False
-        start = None
-
-        for i, is_zero in enumerate(zero_fz_mask):
-            if is_zero and not in_seg:
-                in_seg = True
-                start = i
-            elif not is_zero and in_seg:
-                segments.append((start, i - 1))
-                in_seg = False
-        if in_seg:
-            segments.append((start, len(zero_fz_mask) - 1))
-
-        # Find the longest/most stable zero-force segment
-        best_seg = None
-        best_score = float('inf')
-
-        for (s, e) in segments:
-            duration = t[e] - t[s]
-            if duration < baseline_duration:
-                continue
-
-            # Score = variance (lower is better)
-            seg_variance = sum(df[c].iloc[s:e+1].var() for c in baro_cols)
-
-            if seg_variance < best_score:
-                best_score = seg_variance
-                best_seg = (s, e)
-
-        if best_seg is None:
-            print(f"  WARNING: No zero-force segments ≥ {baseline_duration}s found.")
-            print(f"  Using all {np.sum(zero_fz_mask)} scattered zero-force samples.")
-            mask = zero_fz_mask
-        else:
-            s, e = best_seg
-            mask = df.index.isin(range(s, e + 1))
-            print(f"  ✓ Best zero-force period: t={t[s]:.3f}-{t[e]:.3f}s (indices {s}-{e})")
-            print(f"    Variance: {best_score:.4f}, Duration: {t[e]-t[s]:.1f}s")
-
-    else:
-        raise ValueError(f"Unknown baseline method '{method}'. Use 'auto', 'fixed', or 'zero_fz'.")
-
-    # === Apply baseline subtraction ===
-    n_baseline = mask.sum()
-    if n_baseline == 0:
-        print("  ERROR: No baseline samples found!")
-        return df
-
-    print(f"\n  Subtracting baseline from {len(baro_cols)} barometers:")
-    for c in baro_cols:
-        baseline = df.loc[mask, c].mean()
-        std = df.loc[mask, c].std()
-        df[c] = df[c] - baseline
-
-        # Quality indicator
-        quality = "✓ excellent" if std < 0.5 else "✓ good" if std < 1.0 else "⚠ fair" if std < 2.0 else "✗ poor"
-        print(f"    {c}: baseline={baseline:7.2f} hPa, std={std:5.3f} hPa  {quality}")
-
-    return df
-
-
-def _plot_baseline_diagnostics(df, t, scan_indices, variance_profile,
-                               best_idx, window_samples, baro_cols, save_path):
-    """Helper function to create diagnostic plot for baseline selection."""
-
-    fig, axes = plt.subplots(3, 1, figsize=(12, 10))
-
-    # Plot 1: Variance profile across time
-    ax = axes[0]
-    scan_times = t[scan_indices]
-    ax.plot(scan_times, variance_profile, 'b-', linewidth=1.5, label='Total variance')
-
-    # Mark the selected baseline region
-    best_time = t[best_idx]
-    best_time_end = t[best_idx + window_samples - 1]
-    ax.axvspan(best_time, best_time_end, alpha=0.3, color='green', label='Selected baseline')
-
-    ax.set_xlabel('Time [s]')
-    ax.set_ylabel('Total Variance')
-    ax.set_title('Baseline Selection: Variance Scan')
-    ax.grid(alpha=0.3)
-    ax.legend()
-
-    # Plot 2: Barometer traces with baseline region highlighted
-    ax = axes[1]
-    for i, c in enumerate(baro_cols):
-        ax.plot(t, df[c], linewidth=0.8, alpha=0.7, label=c)
-    ax.axvspan(best_time, best_time_end, alpha=0.3, color='green')
-    ax.set_xlabel('Time [s]')
-    ax.set_ylabel('Pressure [hPa]')
-    ax.set_title('Barometer Data (before zeroing)')
-    ax.grid(alpha=0.3)
-    ax.legend(ncol=6, fontsize=8)
-
-    # Plot 3: Zoomed view of baseline region
-    ax = axes[2]
-    baseline_mask = (t >= best_time) & (t <= best_time_end)
-    t_zoom = t[baseline_mask]
-
-    for c in baro_cols:
-        y_zoom = df[c].to_numpy()[baseline_mask]
-        ax.plot(t_zoom, y_zoom, linewidth=1.2, label=c)
-
-        # Show mean and std
-        mean_val = y_zoom.mean()
-        std_val = y_zoom.std()
-        ax.axhline(mean_val, color='gray', linestyle='--', alpha=0.5, linewidth=0.8)
-
-    ax.set_xlabel('Time [s]')
-    ax.set_ylabel('Pressure [hPa]')
-    ax.set_title(f'Baseline Region (zoomed) - Duration: {best_time_end - best_time:.2f}s')
-    ax.grid(alpha=0.3)
-    ax.legend(ncol=6, fontsize=8)
-
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=200, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  Diagnostic plot saved: {save_path}")
-
-
-def remove_barometer_outliers(df: pd.DataFrame, method='iqr', threshold=3.0) -> pd.DataFrame:
-    """
-    Remove rows where any barometer has outlier values.
-
-    Parameters:
-    -----------
-    df : pd.DataFrame
-        DataFrame containing barometer columns (b1..b6)
-    method : str
-        'iqr' for Interquartile Range method (default)
-        'zscore' for Z-score method
-    threshold : float
-        For 'iqr': multiplier for IQR (default 3.0)
-        For 'zscore': number of standard deviations (default 3.0)
-    """
-    df_filtered = df.copy()
-    baro_cols = [f'b{i}' for i in range(1, 7) if f'b{i}' in df.columns]
-
-    if not baro_cols:
-        print("remove_barometer_outliers: No barometer columns found.")
-        return df_filtered
-
-    initial_rows = len(df_filtered)
-    outlier_mask = pd.Series([False] * len(df_filtered), index=df_filtered.index)
-
-    print(f"\nRemoving barometer outliers (method={method}, threshold={threshold}):")
-    for col in baro_cols:
-        if method == 'iqr':
-            Q1 = df_filtered[col].quantile(0.25)
-            Q3 = df_filtered[col].quantile(0.75)
-            IQR = Q3 - Q1
-            lower_bound = Q1 - threshold * IQR
-            upper_bound = Q3 + threshold * IQR
-            col_outliers = (df_filtered[col] < lower_bound) | (df_filtered[col] > upper_bound)
-
-        elif method == 'zscore':
-            mean = df_filtered[col].mean()
-            std = df_filtered[col].std()
-            z_scores = np.abs((df_filtered[col] - mean) / std)
-            col_outliers = z_scores > threshold
-
-        else:
-            raise ValueError(f"Unknown method '{method}'. Use 'iqr' or 'zscore'.")
-
-        outlier_mask = outlier_mask | col_outliers
-        n_outliers = col_outliers.sum()
-        if n_outliers > 0:
-            print(f"  {col}: {n_outliers} outliers detected")
-
-    df_filtered = df_filtered[~outlier_mask].copy()
-    removed_rows = initial_rows - len(df_filtered)
-
-    print(f"Total removed: {removed_rows} rows ({removed_rows/initial_rows*100:.2f}%)")
-
-    return df_filtered
-
-
-def flatten_barometers_by_time(df, skip_initial_fraction=0.05, poly_order=2):
-    """
-    Remove time-based drift from barometers using polynomial detrending.
-
-    This method fits a polynomial trend vs TIME (not temperature) and removes it.
-    Useful when drift is temporal rather than temperature-dependent.
-    """
-    df = df.copy()
-
-    if "time" not in df.columns:
-        print("remove_barometer_drift_polynomial: no 'time' column found, skipping.")
-        return df
-
-    baro_cols = [f"b{i}" for i in range(1, 7) if f"b{i}" in df.columns]
-    if not baro_cols:
-        print("remove_barometer_drift_polynomial: no barometer columns found, skipping.")
-        return df
-
-    t = df["time"].to_numpy()
-    n_total = len(t)
-    n_skip = int(n_total * skip_initial_fraction)
-
-    print(f"\nTime-based drift removal: poly_order={poly_order}, skipping first {n_skip}/{n_total} samples ({skip_initial_fraction*100:.1f}%)")
-
-    # Use relative time for numerical stability
-    t_rel = t - t[0]
-
-    for bcol in baro_cols:
-        P = df[bcol].to_numpy()
-
-        # Use only STABLE data for fitting (skip initial warm-up period)
-        t_stable = t_rel[n_skip:]
-        P_stable = P[n_skip:]
-
-        mask = np.isfinite(t_stable) & np.isfinite(P_stable)
-        if mask.sum() < poly_order + 1:
-            print(f"  {bcol}: not enough valid stable data, skipping.")
-            continue
-
-        # Check if pressure has significant drift
-        P_range = P_stable[mask].max() - P_stable[mask].min()
-        if P_range < 0.1:  # Less than 0.1 hPa variation
-            print(f"  {bcol}: pressure variation too small ({P_range:.2f} hPa), skipping.")
-            continue
-
-        # Fit polynomial: P ≈ polynomial(t)
-        coeffs = np.polyfit(t_stable[mask], P_stable[mask], poly_order)
-
-        # Compute trend for ALL data
-        trend = np.polyval(coeffs, t_rel)
-
-        # Reference to the trend value at the first stable point
-        trend_ref = trend[n_skip]
-
-        # Subtract drift (keep the initial stable value as reference)
-        correction = trend - trend_ref
-        df[bcol] = P - correction
-
-        poly_name = "linear" if poly_order == 1 else f"order-{poly_order}"
-        max_correction = np.abs(correction).max()
-        print(f"  {bcol}: removed time-based drift ({poly_name}, max_correction={max_correction:.2f} hPa)")
-
-    return df
-
-
-def flatten_barometers_by_temperature(df, ref_mode="first", skip_initial_fraction=0.05, poly_order=2):
-    """
-    Remove temperature-driven drift from barometers using polynomial fitting.
-
-    Expects columns:
-        b1..b6  -> pressures
-        t1..t6  -> temperatures (same sensor order)
-    """
-    df = df.copy()
-
-    baro_cols = [f"b{i}" for i in range(1, 7) if f"b{i}" in df.columns]
-    temp_cols = [f"t{i}" for i in range(1, 7) if f"t{i}" in df.columns]
-
-    if not baro_cols or len(baro_cols) != len(temp_cols):
-        print("flatten_barometers_by_temperature: missing t1..t6 or b1..b6 — skipping.")
-        return df
-
-    # Calculate how many samples to skip at the beginning
-    n_total = len(df)
-    n_skip = int(n_total * skip_initial_fraction)
-
-    print(f"\nTemperature-based drift removal: poly_order={poly_order}, skipping first {n_skip}/{n_total} samples ({skip_initial_fraction*100:.1f}%)")
-
-    # Choose temperature reference from STABLE data (after warm-up)
-    T_ref = {}
-    for tcol in temp_cols:
-        stable_temps = df[tcol].iloc[n_skip:]
-        if ref_mode == "mean":
-            T_ref[tcol] = stable_temps.mean()
-        else:  # "first"
-            T_ref[tcol] = stable_temps.iloc[0] if len(stable_temps) > 0 else df[tcol].iloc[0]
-
-    for i in range(1, 7):
-        bcol = f"b{i}"
-        tcol = f"t{i}"
-        if bcol not in df.columns or tcol not in df.columns:
-            continue
-
-        T = df[tcol].to_numpy()
-        P = df[bcol].to_numpy()
-
-        # Use only STABLE data for fitting (skip initial warm-up period)
-        T_stable = T[n_skip:]
-        P_stable = P[n_skip:]
-
-        mask = np.isfinite(T_stable) & np.isfinite(P_stable)
-        if mask.sum() < poly_order + 1:
-            print(f"  {bcol}: not enough valid stable data, skipping.")
-            continue
-
-        # Check if temperature has sufficient variation
-        T_range = T_stable[mask].max() - T_stable[mask].min()
-        if T_range < 0.5:  # Less than 0.5°C variation
-            print(f"  {bcol}: temperature variation too small ({T_range:.2f}°C), skipping.")
-            continue
-
-        # Fit polynomial: P ≈ polynomial(T)
-        coeffs = np.polyfit(T_stable[mask], P_stable[mask], poly_order)
-
-        # Compute trend for ALL data (including warm-up period)
-        trend = np.polyval(coeffs, T)
-        trend_ref = np.polyval(coeffs, np.full_like(T, T_ref[tcol]))
-
-        # Calculate the correction
-        correction = trend - trend_ref
-
-        # Safety check: if correction is unreasonably large, skip it
-        max_correction = np.abs(correction).max()
-        P_range = P_stable[mask].max() - P_stable[mask].min()
-
-        if max_correction > 2 * P_range:  # Correction larger than 2x the pressure range
-            print(f"  {bcol}: correction too large ({max_correction:.2f} hPa vs range {P_range:.2f} hPa), skipping.")
-            continue
-
-        # Subtract temperature-dependent drift (referenced to T_ref)
-        df[bcol] = P - correction
-
-        poly_name = "linear" if poly_order == 1 else f"order-{poly_order}"
-        print(f"  {bcol}: removed temperature drift ({poly_name}, T_ref={T_ref[tcol]:.2f}°C, max_correction={max_correction:.2f} hPa)")
-
-    return df
 
 
 def rezero_barometers_when_fz_zero(df: pd.DataFrame, fz_threshold: float = 0.05, min_zero_duration: float = 0.2, min_samples: int = 20) -> pd.DataFrame:
@@ -980,15 +618,32 @@ def plot_path_xy_filtered(out_dir: str,
 
 # ================================ MAIN =================================
 
-def main():
+def process_single_test(TEST_NUM):
+    """Process a single test number."""
+    DATA_DIR = BASE_DIR / f"test {TEST_NUM} - sensor v{VERSION_NUM}"
+    
+    # Input files
+    PROCESSING_FILE = DATA_DIR / f"processing_test_{TEST_NUM}.csv"
+    BAROMETER_FILE = DATA_DIR / f"{TEST_NUM}barometers_trial.txt"
+    
+    # Output
+    OUTPUT_FILE = DATA_DIR / f"synchronized_events_{TEST_NUM}.csv"
+    save_plots_dir = DATA_DIR / "plots synchronized"
+    save_plots_dir.mkdir(exist_ok=True, parents=True)
+    
     print("#" * 60)
     print(f"# BAROMETER-FORCE SYNC | Test {TEST_NUM} v{VERSION_NUM}")
     print("#" * 60)
     print(f"Configuration:")
     print(f"  - Sync: direction={ASOF_DIRECTION}, tolerance={ASOF_TOLERANCE_S}s")
-    print(f"  - Drift removal: {DRIFT_REMOVAL_METHOD}")
+    print(f"  - Warmup removal: {REMOVE_INITIAL_WARMUP_DURATION}s")
+    print(f"  - Drift removal method: {DRIFT_REMOVAL_METHOD}")
+    if DRIFT_REMOVAL_METHOD in ['ema', 'both']:
+        print(f"    - EMA alpha: {EMA_ALPHA}")
+    if DRIFT_REMOVAL_METHOD in ['temperature', 'both']:
+        print(f"    - Temperature skip fraction: {TEMP_SKIP_INITIAL_FRACTION}")
+    print(f"  - Zero at start: {ZERO_AT_START}")
     print(f"  - Dynamic re-zeroing: {ENABLE_DYNAMIC_REZERO_ON_ZERO_FZ}")
-    print(f"  - Outlier removal: {REMOVE_BAROMETER_OUTLIERS}")
     print()
 
     # Check input files exist
@@ -1009,57 +664,134 @@ def main():
     print(f"  - Processing data: {len(proc_df)} rows")
     print(f"  - Barometer data:  {len(baro_df)} rows")
 
-    # Plot raw barometers
-    plot_barometers_subplots(baro_df,  save_path=save_plots_dir / "1barometers_subplots_before_processing.png",  suptitle="Barometers (before processing)")
+    # Keep original for comparison
+    baro_df_original = baro_df.copy()
 
-    # Remove initial warm-up data if enabled
+    # Plot raw barometers (PLOT 1)
+    plot_barometers_subplots(baro_df,  
+                            save_path=save_plots_dir / "1_barometers_raw.png",  
+                            suptitle="Barometers (raw data)")
+
+    # STEP 1: Remove initial warm-up data
     if REMOVE_INITIAL_WARMUP_DURATION > 0:
         t0 = baro_df["time"].min()
         initial_len = len(baro_df)
         baro_df = baro_df[baro_df["time"] > t0 + REMOVE_INITIAL_WARMUP_DURATION].copy()
         removed_rows = initial_len - len(baro_df)
-        print(f"\nRemoved {removed_rows} rows from initial {REMOVE_INITIAL_WARMUP_DURATION}s warm-up period")
+        print(f"\nSTEP 1: Removed {removed_rows} rows from initial {REMOVE_INITIAL_WARMUP_DURATION}s warm-up period")
         baro_df = baro_df.reset_index(drop=True)
 
-    # Apply drift removal
-    if DRIFT_REMOVAL_METHOD == 'time':
-        baro_df = flatten_barometers_by_time( baro_df, skip_initial_fraction=DRIFT_SKIP_INITIAL_FRACTION, poly_order=DRIFT_POLY_ORDER )
-        plot_barometers_subplots(baro_df, save_path=save_plots_dir / "2barometers_subplots_drift_removed.png", suptitle="Barometers (after time-based drift removal)")
+        plot_barometers_subplots(baro_df,
+                                save_path=save_plots_dir / "2 _barometers_after_warmup_removal.png",
+                                suptitle="Barometers (after warmup removal)")
+
+    # STEP 1.5: Remove hardware steps/jumps (before drift removal to prevent EMA "tails")
+    if ENABLE_STEP_LEVELING:
+        print(f"\nSTEP 1.5: Applying robust step leveling...")
+        baro_df = remove_steps_robust(baro_df, threshold=STEP_THRESHOLD_HPA, window_size=STEP_WINDOW_SIZE)
+        plot_barometers_subplots(baro_df,
+                                save_path=save_plots_dir / "2.5_barometers_after_step_leveling.png",
+                                suptitle="Barometers (after step leveling)")
+
+    # STEP 2: Apply drift removal
+    ema_trends = {}
+    temp_coeffs = {}
+    
+    if DRIFT_REMOVAL_METHOD == 'ema':
+        print("\nSTEP 2: Applying EMA drift removal...")
+        baro_df, ema_trends = remove_drift_ema(
+            baro_df, 
+            alpha=EMA_ALPHA,
+            alpha_override=EMA_ALPHA_OVERRIDE,
+            zero_at_start=ZERO_AT_START
+        )
+        plot_barometers_subplots(baro_df,
+                                save_path=save_plots_dir / "3_barometers_after_ema.png",
+                                suptitle="Barometers (after EMA drift removal)")
+    
     elif DRIFT_REMOVAL_METHOD == 'temperature':
-        baro_df = flatten_barometers_by_temperature( baro_df,  skip_initial_fraction=DRIFT_SKIP_INITIAL_FRACTION, poly_order=DRIFT_POLY_ORDER  )
-        plot_barometers_subplots(baro_df, save_path=save_plots_dir / "2barometers_subplots_drift_removed.png", suptitle="Barometers (after temp drift flattening)")
+        print("\nSTEP 2: Applying temperature-based drift removal...")
+        baro_df, temp_coeffs = remove_drift_temperature_linear(
+            baro_df,
+            skip_initial_fraction=TEMP_SKIP_INITIAL_FRACTION,
+            zero_at_start=ZERO_AT_START
+        )
+        plot_barometers_subplots(baro_df,
+                                save_path=save_plots_dir / "3_barometers_after_temp_correction.png",
+                                suptitle="Barometers (after temperature correction)")
+        
+        # Plot temperature correlation
+        plot_temperature_vs_pressure(baro_df, temp_coeffs=temp_coeffs,
+                                    save_path=save_plots_dir / "temperature_vs_pressure_correlation.png")
+    
+    elif DRIFT_REMOVAL_METHOD == 'both':
+        print("\nSTEP 2a: Applying temperature-based drift removal...")
+        baro_df_temp, temp_coeffs = remove_drift_temperature_linear(
+            baro_df.copy(),
+            skip_initial_fraction=TEMP_SKIP_INITIAL_FRACTION,
+            zero_at_start=ZERO_AT_START
+        )
+        
+        print("\nSTEP 2b: Applying EMA drift removal...")
+        baro_df_ema, ema_trends = remove_drift_ema(
+            baro_df.copy(),
+            alpha=EMA_ALPHA,
+            alpha_override=EMA_ALPHA_OVERRIDE,
+            zero_at_start=ZERO_AT_START
+        )
+        
+        # Create comparison plot
+        print("\nGenerating comparison plot...")
+        plot_drift_comparison(
+            baro_df, baro_df_ema, baro_df_temp,
+            ema_trends=ema_trends,
+            temp_coeffs=temp_coeffs,
+            save_path=save_plots_dir / "3_drift_removal_comparison.png"
+        )
+        
+        # Plot temperature correlation
+        plot_temperature_vs_pressure(baro_df, temp_coeffs=temp_coeffs,
+                                    save_path=save_plots_dir / "temperature_vs_pressure_correlation.png")
+        
+        # Choose which method to use for final output
+        # You can change this to baro_df_temp if temperature correction works better
+        print("\nUsing EMA method for final output (you can change this in code)")
+        baro_df = baro_df_ema
+    
+    elif DRIFT_REMOVAL_METHOD == 'none':
+        print("\nSTEP 2: Skipping drift removal (method='none')")
+        # Still zero if requested
+        if ZERO_AT_START:
+            baro_df = zero_barometers_fixed(baro_df, reference_index='first_valid')
+    
+    else:
+        raise ValueError(f"Unknown drift removal method: {DRIFT_REMOVAL_METHOD}")
 
     # Synchronize
     print("\nSynchronizing data...")
     merged = synchronize_data(proc_df, baro_df)
     print(f"  - Synchronized: {len(merged)} rows")
 
-    # Zero barometers at baseline
-    merged = zero_barometers(merged,
-                            method=BASELINE_METHOD,
-                            baseline_duration=BASELINE_DURATION_S,
-                            warmup_s=BASELINE_WARMUP_S,
-                            fz_threshold=BASELINE_FZ_THRESHOLD,
-                            save_diagnostic_plot=save_plots_dir / "baseline_diagnostic.png")
-
-    # Dynamic re-zeroing when Fz ≈ 0
+    # STEP 3: Dynamic re-zeroing when Fz ≈ 0 (optional)
     if ENABLE_DYNAMIC_REZERO_ON_ZERO_FZ:
-        merged = rezero_barometers_when_fz_zero( merged, fz_threshold=FZ_ZERO_THRESHOLD, min_zero_duration=MIN_ZERO_DURATION_S, min_samples=MIN_ZERO_SAMPLES, )
+        merged = rezero_barometers_when_fz_zero(
+            merged,
+            fz_threshold=FZ_ZERO_THRESHOLD,
+            min_zero_duration=MIN_ZERO_DURATION_S,
+            min_samples=MIN_ZERO_SAMPLES
+        )
 
-    # Remove barometer outliers
-    if REMOVE_BAROMETER_OUTLIERS:
-        merged = remove_barometer_outliers(merged, method=OUTLIER_METHOD, threshold=OUTLIER_THRESHOLD)
-        print(f"  - After outlier removal: {len(merged)} rows")
-
-    # Plot processed data
-    print("\nGenerating plots...")
-    plot_barometers_subplots(merged, save_path=save_plots_dir / "3barometers_subplots.png", suptitle="Barometers (after processing)")
+    # Plot final processed barometers
+    print("\nGenerating final plots...")
+    plot_barometers_subplots(merged, 
+                            save_path=save_plots_dir / "4_barometers_final.png", 
+                            suptitle="Barometers (final processed)")
 
     plot_forces_torques_subplots(merged, save_path=save_plots_dir / "ati_forces_torques.png")
     plot_barometers_vs_fz(merged, save_path=save_plots_dir / "barometers_vs_Fz.png")
     plot_barometers_vs_fx(merged, save_path=save_plots_dir / "barometers_vs_Fx.png")
     plot_barometers_vs_fy(merged, save_path=save_plots_dir / "barometers_vs_Fy.png")
-    plt.close()
+    plt.close('all')
 
     # Apply spatial filter
     print("\nApplying spatial filter...")
@@ -1067,7 +799,20 @@ def main():
     print(f"  - After spatial filter: {len(masked)} rows")
 
     # Plot trajectory
-    plot_path_xy_filtered( out_dir=str(save_plots_dir), X_mm=masked["x_position_mm"].to_numpy(), Y_mm=masked["y_position_mm"].to_numpy(), t_s=masked["time"].to_numpy(), test_num=TEST_NUM, break_on_time_gaps=True, gap_factor_time=PATH_GAP_FACTOR_TIME, break_on_xy_jumps=PATH_BREAK_ON_XY_JUMPS, jump_factor=PATH_JUMP_FACTOR, rect_size_mm=PATH_PLOT_RECT_SIZE_MM, xlim=PATH_PLOT_XLIM, ylim=PATH_PLOT_YLIM )
+    plot_path_xy_filtered(
+        out_dir=str(save_plots_dir),
+        X_mm=masked["x_position_mm"].to_numpy(),
+        Y_mm=masked["y_position_mm"].to_numpy(),
+        t_s=masked["time"].to_numpy(),
+        test_num=TEST_NUM,
+        break_on_time_gaps=True,
+        gap_factor_time=PATH_GAP_FACTOR_TIME,
+        break_on_xy_jumps=PATH_BREAK_ON_XY_JUMPS,
+        jump_factor=PATH_JUMP_FACTOR,
+        rect_size_mm=PATH_PLOT_RECT_SIZE_MM,
+        xlim=PATH_PLOT_XLIM,
+        ylim=PATH_PLOT_YLIM
+    )
 
     if masked.empty:
         print("WARNING: No rows after spatial filter — saving unfiltered synchronized data instead.")
@@ -1087,12 +832,69 @@ def main():
     desired_cols = ['t', 'b1', 'b2', 'b3', 'b4', 'b5', 'b6', 'x', 'y', 'fx', 'fy', 'fz', 'tx', 'ty', 'tz']
     masked = masked.reindex(columns=desired_cols)
 
+    # STEP 4: Apply no-contact masking to teach model (optional)
+    if ENABLE_NO_CONTACT_MASKING:
+        print("\nApplying no-contact masking to training data...")
+        masked = mask_no_contact_samples(
+            masked, 
+            fz_threshold=NO_CONTACT_FZ_THRESHOLD,
+            sentinel=NO_CONTACT_SENTINEL
+        )
+
     # Save output
     masked.to_csv(OUTPUT_FILE, index=False)
     print(f"\nOutput saved: {OUTPUT_FILE}")
     print(f"  - Rows: {len(masked)}")
     print(f"  - Columns: {list(masked.columns)}")
     print("\nProcessing complete!")
+    print("\nBarometer processing pipeline:")
+    print("  1. Remove initial samples (warmup removal)")
+    if ENABLE_STEP_LEVELING:
+        print(f"  2. Step detection & leveling (threshold: {STEP_THRESHOLD_HPA} hPa)")
+    print(f"  3. Apply drift removal (method: {DRIFT_REMOVAL_METHOD})")
+    if DRIFT_REMOVAL_METHOD in ['ema', 'both']:
+        print(f"     - EMA alpha={EMA_ALPHA}, time constant ≈ {1/EMA_ALPHA:.0f} samples")
+    if DRIFT_REMOVAL_METHOD in ['temperature', 'both']:
+        print(f"     - Linear temperature compensation")
+    if ZERO_AT_START:
+        print("  4. Zero at start")
+    if ENABLE_DYNAMIC_REZERO_ON_ZERO_FZ:
+        print(f"  5. Dynamic re-zeroing when Fz ≈ 0")
+    if ENABLE_NO_CONTACT_MASKING:
+        print(f"  6. No-contact masking (|fz| < {NO_CONTACT_FZ_THRESHOLD} → x,y,fx,fy = {NO_CONTACT_SENTINEL})")
+    
+    print(f"\nTest {TEST_NUM} processing complete!")
+    print("=" * 60 + "\n")
+
+
+def main():
+    """Main entry point - process all test numbers."""
+    # Ensure TEST_NUMS is a list
+    test_list = TEST_NUMS if isinstance(TEST_NUMS, list) else [TEST_NUMS]
+    
+    print("\n" + "=" * 60)
+    print(f"STARTING BATCH PROCESSING: {len(test_list)} test(s)")
+    print(f"Test numbers: {test_list}")
+    print("=" * 60 + "\n")
+    
+    for idx, test_num in enumerate(test_list, 1):
+        print(f"\n{'#' * 60}")
+        print(f"# PROCESSING TEST {idx}/{len(test_list)}: {test_num}")
+        print(f"{'#' * 60}\n")
+        
+        try:
+            process_single_test(test_num)
+        except Exception as e:
+            print(f"\n{'!' * 60}")
+            print(f"ERROR processing test {test_num}: {e}")
+            print(f"{'!' * 60}")
+            print("Continuing with next test...\n")
+            continue
+    
+    print("\n" + "=" * 60)
+    print("BATCH PROCESSING COMPLETE")
+    print(f"Processed {len(test_list)} test(s)")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

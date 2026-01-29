@@ -9,10 +9,21 @@ import numpy as np
 # ================== CONFIG ==================
 # Base directory that contains all test folders
 DATA_DIRECTORY = Path(r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data")
-VERSION_NUM = 4.7
+VERSION_NUM = 5.103
+
+# Fractions must sum to 1.0
+TRAIN_FRAC = 0.7
+VAL_FRAC   = 0.15
+TEST_FRAC  = 0.15
 
 # Relative CSV paths inside DATA_DIRECTORY
 CSV_FILENAMES = [
+    
+    # r"test 2 - sensor v5\synchronized_events_2.csv",
+    # r"test 3 - sensor v5\synchronized_events_3.csv",    
+    # r"test 4 - sensor v5\synchronized_events_4.csv",
+    # r"test 5 - sensor v5\synchronized_events_5.csv",
+    
     
     # r"test 4301 - sensor v4\synchronized_events_4301.csv",
     # r"test 4302 - sensor v4\synchronized_events_4302.csv",
@@ -48,8 +59,8 @@ CSV_FILENAMES = [
     # r"test 4621 - sensor v4\synchronized_events_4621.csv",
     # r"test 4623 - sensor v4\synchronized_events_4623.csv",
     
-    r"test 4700 - sensor v4\synchronized_events_4700.csv",
-    r"test 4701 - sensor v4\synchronized_events_4701.csv",
+    # r"test 4700 - sensor v4\synchronized_events_4700.csv",
+    # r"test 4701 - sensor v4\synchronized_events_4701.csv",
     # r"test 4702 - sensor v4\synchronized_events_4702.csv",
     
     # r"test 4800 - sensor v4\synchronized_events_4800.csv",
@@ -72,16 +83,77 @@ CSV_FILENAMES = [
     # r"test 5701 - sensor v5\synchronized_events_5701.csv",
     # r"test 5702 - sensor v5\synchronized_events_5702.csv",
     # r"test 5703 - sensor v5\synchronized_events_5703.csv",
+    # r"test 5704 - sensor v5\synchronized_events_5704.csv",
     
     # r"test 5800 - sensor v5\synchronized_events_5800.csv",
     # r"test 5801 - sensor v5\synchronized_events_5801.csv",
     # r"test 5802 - sensor v5\synchronized_events_5802.csv",
     # r"test 5803 - sensor v5\synchronized_events_5803.csv",
+    # r"test 5804 - sensor v5\synchronized_events_5804.csv",
+    # r"test 5805 - sensor v5\synchronized_events_5805.csv",
+    # r"test 5806 - sensor v5\synchronized_events_5806.csv",
     
     # r"test 5900 - sensor v5\synchronized_events_5900.csv",
     # r"test 5901 - sensor v5\synchronized_events_5901.csv",
     # r"test 5902 - sensor v5\synchronized_events_5902.csv",
     # r"test 5903 - sensor v5\synchronized_events_5903.csv",
+    # r"test 5904 - sensor v5\synchronized_events_5904.csv",
+    # r"test 5905 - sensor v5\synchronized_events_5905.csv",
+    # r"test 5906 - sensor v5\synchronized_events_5906.csv",
+    
+    # r"test 51000 - sensor v5\synchronized_events_51000.csv",
+    # r"test 51001 - sensor v5\synchronized_events_51001.csv",
+    # r"test 51002 - sensor v5\synchronized_events_51002.csv",
+    # r"test 51003 - sensor v5\synchronized_events_51003.csv",
+    # r"test 51004 - sensor v5\synchronized_events_51004.csv",
+    # r"test 51005 - sensor v5\synchronized_events_51005.csv",
+    # r"test 51006 - sensor v5\synchronized_events_51006.csv",
+    # r"test 51007 - sensor v5\synchronized_events_51007.csv",  
+    # r"test 51008 - sensor v5\synchronized_events_51008.csv", 
+    
+    r"test 51030 - sensor v5\synchronized_events_51030.csv",
+    r"test 51031 - sensor v5\synchronized_events_51031.csv",
+    r"test 51032 - sensor v5\synchronized_events_51032.csv",
+    r"test 51033 - sensor v5\synchronized_events_51033.csv",
+    r"test 51034 - sensor v5\synchronized_events_51034.csv",
+    r"test 51035 - sensor v5\synchronized_events_51035.csv",
+    r"test 51036 - sensor v5\synchronized_events_51036.csv",
+    
+    # r"test 51100 - sensor v5\synchronized_events_51100.csv", 
+    # r"test 51101 - sensor v5\synchronized_events_51101.csv",
+    # r"test 51102 - sensor v5\synchronized_events_51102.csv",
+    # r"test 51103 - sensor v5\synchronized_events_51103.csv",
+    # r"test 51104 - sensor v5\synchronized_events_51104.csv",
+    # r"test 51105 - sensor v5\synchronized_events_51105.csv",
+    # r"test 51106 - sensor v5\synchronized_events_51106.csv",
+    
+    # r"test 51130 - sensor v5\synchronized_events_51130.csv",
+    # r"test 51131 - sensor v5\synchronized_events_51131.csv",
+    
+    # r"test 51200 - sensor v5\synchronized_events_51200.csv",
+    # r"test 51201 - sensor v5\synchronized_events_51201.csv",
+    # r"test 51202 - sensor v5\synchronized_events_51202.csv",
+    # r"test 51203 - sensor v5\synchronized_events_51203.csv",
+    # r"test 51204 - sensor v5\synchronized_events_51204.csv",
+    # r"test 51205 - sensor v5\synchronized_events_51205.csv",
+    
+    # r"test 51300 - sensor v5\synchronized_events_51300.csv",
+    # r"test 51301 - sensor v5\synchronized_events_51301.csv",
+    # r"test 51302 - sensor v5\synchronized_events_51302.csv",
+    # r"test 51303 - sensor v5\synchronized_events_51303.csv",
+    # r"test 51304 - sensor v5\synchronized_events_51304.csv",
+    
+    # r"test 51400 - sensor v5\synchronized_events_51400.csv",
+    # r"test 51401 - sensor v5\synchronized_events_51401.csv",
+    # r"test 51402 - sensor v5\synchronized_events_51402.csv",
+    # r"test 51403 - sensor v5\synchronized_events_51403.csv",
+    # r"test 51404 - sensor v5\synchronized_events_51404.csv",
+    # r"test 51405 - sensor v5\synchronized_events_51405.csv",
+    
+    # r"test 51500 - sensor v5\synchronized_events_51500.csv",
+    # r"test 51501 - sensor v5\synchronized_events_51501.csv",
+    # r"test 51502 - sensor v5\synchronized_events_51502.csv",
+    # r"test 51503 - sensor v5\synchronized_events_51503.csv",
     
     # r"test 6000 - sensor v6\synchronized_events_6000.csv",
     # r"test 6001 - sensor v6\synchronized_events_6001.csv",
@@ -94,12 +166,6 @@ CSV_FILENAMES = [
     
     
 ]
-
-
-# Fractions must sum to 1.0
-TRAIN_FRAC = 0.7
-VAL_FRAC   = 0.15
-TEST_FRAC  = 0.15
 
 # Output directory for final combined datasets
 OUTPUT_DIR = Path(r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\train_validation_test_data")

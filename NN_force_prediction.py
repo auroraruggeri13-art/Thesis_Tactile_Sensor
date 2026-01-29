@@ -40,7 +40,7 @@ class RegressionModelNN(nn.Module):
         # Learning rate scheduler
         self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min', 
                                           factor=0.5, patience=15, 
-                                          verbose=True, min_lr=1e-6)
+                                          min_lr=1e-6)
 
         self.training_losses = []
         self.validation_metrics = []
@@ -295,7 +295,7 @@ def calculate_grouped_rmse(y_true, y_pred, target_names):
 if __name__ == "__main__":
     DATA_DIRECTORY = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\train_validation_test_data"
     
-    sensor_version = 4
+    sensor_version = 5.15
 
     # Files already created by the previous script
     TRAIN_FILENAME = f"train_data_v{sensor_version}.csv"

@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 # ===================== EDIT THESE IN VS CODE =====================
-TRIAL = 5903
+TRIAL = 51036 
 DATA_DIR = Path(r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data\test {} - sensor v5".format(TRIAL))
 
 TAG0_FILE = DATA_DIR / f"{TRIAL}tag0_pose_trial.txt"
@@ -185,72 +185,63 @@ def plot_tags_3d(tag_dfs: dict[str, pd.DataFrame], units: str = "mm"):
     ax.legend()
     set_axes_equal(ax)
     plt.tight_layout()
-    plt.show()
+    plt.close()
 
 
 def plot_probe_2d_projections(probe_df: pd.DataFrame, units: str = "mm"):
-    """Plot 2D projections of probe path in its own reference frame (XY, XZ, YZ planes)."""
+    """Plot 2D projections of probe path in camera frame (XY, XZ, YZ planes)."""
     scale = 1000.0 if units == "mm" else 1.0
     
-    # Get probe positions in camera frame
+    # Get probe positions in camera frame - these are already in a fixed frame!
     px_cam = probe_df["px_m"].to_numpy() * scale
     py_cam = probe_df["py_m"].to_numpy() * scale
     pz_cam = probe_df["pz_m"].to_numpy() * scale
     
-    # Transform to probe reference frame
-    # For each time step, we need to express position in probe's own frame
-    N = len(probe_df)
-    pos_in_probe = np.zeros((N, 3))
-    
-    for i in range(N):
-        R_cam_probe = probe_df["R"].iloc[i]  # (3,3) rotation from probe to camera
-        p_cam = np.array([px_cam[i], py_cam[i], pz_cam[i]])
-        
-        # Transform: subtract probe origin, then rotate to probe frame
-        p_origin = np.array([px_cam[i], py_cam[i], pz_cam[i]])
-        # Express relative to first position as origin
-        p_rel = p_cam - np.array([px_cam[0], py_cam[0], pz_cam[0]])
-        # Rotate to probe frame (inverse rotation)
-        pos_in_probe[i] = R_cam_probe.T @ p_rel
+    # Make relative to first position (origin at start)
+    pos_in_cam = np.column_stack([
+        px_cam - px_cam[0],
+        py_cam - py_cam[0],
+        pz_cam - pz_cam[0]
+    ])
     
     # Create 2D projection plots
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     
     # XY plane
-    axes[0].plot(pos_in_probe[:, 0], pos_in_probe[:, 1], 'b-', linewidth=1.5)
-    axes[0].scatter(pos_in_probe[0, 0], pos_in_probe[0, 1], c='g', s=50, marker='o', label='Start')
-    axes[0].scatter(pos_in_probe[-1, 0], pos_in_probe[-1, 1], c='r', s=50, marker='x', label='End')
-    axes[0].set_xlabel(f'Probe X [{units}]')
-    axes[0].set_ylabel(f'Probe Y [{units}]')
-    axes[0].set_title('XY Projection (Probe Frame)')
+    axes[0].plot(pos_in_cam[:, 0], pos_in_cam[:, 1], 'b-', linewidth=1.5)
+    axes[0].scatter(pos_in_cam[0, 0], pos_in_cam[0, 1], c='g', s=50, marker='o', label='Start')
+    axes[0].scatter(pos_in_cam[-1, 0], pos_in_cam[-1, 1], c='r', s=50, marker='x', label='End')
+    axes[0].set_xlabel(f'Camera X [{units}]')
+    axes[0].set_ylabel(f'Camera Y [{units}]')
+    axes[0].set_title('XY Projection (Camera Frame)')
     axes[0].grid(True, alpha=0.3)
     axes[0].axis('equal')
     axes[0].legend()
     
     # XZ plane
-    axes[1].plot(pos_in_probe[:, 0], pos_in_probe[:, 2], 'b-', linewidth=1.5)
-    axes[1].scatter(pos_in_probe[0, 0], pos_in_probe[0, 2], c='g', s=50, marker='o', label='Start')
-    axes[1].scatter(pos_in_probe[-1, 0], pos_in_probe[-1, 2], c='r', s=50, marker='x', label='End')
-    axes[1].set_xlabel(f'Probe X [{units}]')
-    axes[1].set_ylabel(f'Probe Z [{units}]')
-    axes[1].set_title('XZ Projection (Probe Frame)')
+    axes[1].plot(pos_in_cam[:, 0], pos_in_cam[:, 2], 'b-', linewidth=1.5)
+    axes[1].scatter(pos_in_cam[0, 0], pos_in_cam[0, 2], c='g', s=50, marker='o', label='Start')
+    axes[1].scatter(pos_in_cam[-1, 0], pos_in_cam[-1, 2], c='r', s=50, marker='x', label='End')
+    axes[1].set_xlabel(f'Camera X [{units}]')
+    axes[1].set_ylabel(f'Camera Z [{units}]')
+    axes[1].set_title('XZ Projection (Camera Frame)')
     axes[1].grid(True, alpha=0.3)
     axes[1].axis('equal')
     axes[1].legend()
     
     # YZ plane
-    axes[2].plot(pos_in_probe[:, 1], pos_in_probe[:, 2], 'b-', linewidth=1.5)
-    axes[2].scatter(pos_in_probe[0, 1], pos_in_probe[0, 2], c='g', s=50, marker='o', label='Start')
-    axes[2].scatter(pos_in_probe[-1, 1], pos_in_probe[-1, 2], c='r', s=50, marker='x', label='End')
-    axes[2].set_xlabel(f'Probe Y [{units}]')
-    axes[2].set_ylabel(f'Probe Z [{units}]')
-    axes[2].set_title('YZ Projection (Probe Frame)')
+    axes[2].plot(pos_in_cam[:, 1], pos_in_cam[:, 2], 'b-', linewidth=1.5)
+    axes[2].scatter(pos_in_cam[0, 1], pos_in_cam[0, 2], c='g', s=50, marker='o', label='Start')
+    axes[2].scatter(pos_in_cam[-1, 1], pos_in_cam[-1, 2], c='r', s=50, marker='x', label='End')
+    axes[2].set_xlabel(f'Camera Y [{units}]')
+    axes[2].set_ylabel(f'Camera Z [{units}]')
+    axes[2].set_title('YZ Projection (Camera Frame)')
     axes[2].grid(True, alpha=0.3)
     axes[2].axis('equal')
     axes[2].legend()
     
     plt.tight_layout()
-    plt.show()
+    plt.close()
 
 
 

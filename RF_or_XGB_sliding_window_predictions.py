@@ -30,18 +30,58 @@ from sklearn.ensemble import RandomForestRegressor
 # ============================================================
 
 DATA_DIRECTORY = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\train_validation_test_data"
-sensor_version = 5.9
+sensor_version = 5.103
 TRAIN_FILENAME = f"train_data_v{sensor_version}.csv"
+VALIDATION_FILENAME = f"validation_data_v{sensor_version}.csv"
 TEST_FILENAME  = f"test_data_v{sensor_version}.csv"
 
 TIME_COL   = "t"
 BARO_COLS  = ["b1", "b2", "b3", "b4", "b5", "b6"]
-TARGET_COLS = ["x", "y", "fx", "fy", "fz"]
+TARGET_COLS = ["x", "y", "fz","tz"]
 
 RANDOM_STATE = 42
 
+# Window size study configuration
+RUN_WINDOW_SIZE_STUDY = False  # Set to True to test multiple window sizes and generate comparison plots
+WINDOW_SIZES = [1, 5, 10, 15, 20]  # Window sizes to test during hyperparameter search
+
 # Sliding window size (in samples). Looks at past WINDOW_SIZE samples.
-WINDOW_SIZE = 10   # 10 past samples (~0.10s at 100 Hz)
+# Used when RUN_WINDOW_SIZE_STUDY = False
+WINDOW_SIZE = 10   # 10 past samples (~0.1s at 100 Hz)
+
+# Learning rate and n_estimators tuning configuration
+RUN_LEARNING_RATE_STUDY = False  # Set to True to tune learning rate and n_estimators
+LEARNING_RATE_CONFIGS = [
+    {'learning_rate': 0.01, 'n_estimators': 500},
+    {'learning_rate': 0.03, 'n_estimators': 450},
+    {'learning_rate': 0.05, 'n_estimators': 400},
+    {'learning_rate': 0.075, 'n_estimators': 350},
+    {'learning_rate': 0.1, 'n_estimators': 300},
+    {'learning_rate': 0.15, 'n_estimators': 250},
+    {'learning_rate': 0.2, 'n_estimators': 200},
+    {'learning_rate': 0.25, 'n_estimators': 180},
+    {'learning_rate': 0.3, 'n_estimators': 150},
+]
+
+# Default learning rate settings (used when RUN_LEARNING_RATE_STUDY = False)
+# Separate for position and force predictions
+LR_POSITION = 0.03  # Learning rate for x, y
+N_EST_POSITION = 450  # Number of estimators for x, y
+LR_FORCE = 0.075  # Learning rate for fx, fy, fz
+N_EST_FORCE = 350  # Number of estimators for fx, fy, fz
+
+# num_leaves tuning configuration
+RUN_NUM_LEAVES_STUDY = False  # Set to True to tune num_leaves
+NUM_LEAVES_CONFIGS = [10, 100, 150, 200, 250, 300]  # Values to test
+
+# Default num_leaves settings (used when RUN_NUM_LEAVES_STUDY = False)
+# Separate for position and force predictions
+NUM_LEAVES_POSITION = 200  # num_leaves for x, y
+NUM_LEAVES_FORCE = 200  # num_leaves for fx, fy, fz
+
+# No-contact sentinel conversion: Convert sentinel values to NaN for training
+CONVERT_SENTINEL_TO_NAN = True  # Set to True to enable
+NO_CONTACT_SENTINEL = -999.0  # Sentinel value used in data_organization script
 
 # Optional denoising (rolling mean on barometer channels BEFORE diffs)
 APPLY_DENOISING = True
@@ -59,6 +99,42 @@ USE_SECOND_DERIVATIVE = False  # Set to True to include second derivatives in fe
 # ============================================================
 # =============== FEATURE ENGINEERING ========================
 # ============================================================
+
+def convert_sentinel_to_nan(df, target_cols, sentinel=-999.0):
+    """
+    Convert sentinel values to NaN in target columns.
+    
+    This enables the model to learn 'no prediction' patterns from training data.
+    When |fz| was ~0 during data collection, data_organization script set
+    x, y, fx, fy to sentinel value (-999). We convert these to NaN so the
+    model learns to associate certain barometer patterns with 'no contact'.
+    
+    Args:
+        df: DataFrame with target columns
+        target_cols: List of target column names
+        sentinel: Sentinel value to replace with NaN
+    
+    Returns:
+        DataFrame with sentinel values converted to NaN
+    """
+    df = df.copy()
+    n_converted = 0
+    
+    for col in target_cols:
+        if col in df.columns:
+            sentinel_mask = df[col] == sentinel
+            n_col_converted = sentinel_mask.sum()
+            if n_col_converted > 0:
+                df.loc[sentinel_mask, col] = np.nan
+                n_converted += n_col_converted
+    
+    if n_converted > 0:
+        pct = 100 * n_converted / (len(df) * len(target_cols))
+        print(f"\nConverted {n_converted} sentinel values ({sentinel}) to NaN ({pct:.2f}% of target values)")
+        print(f"  This teaches the model to recognize no-contact barometer patterns")
+    
+    return df
+
 
 def maybe_denoise(df, baro_cols):
     """
@@ -334,8 +410,10 @@ def plot_error_distributions(y_test, y_pred, target_cols, title_suffix=""):
     return fig
 
 
-def calculate_grouped_rmse(y_true, y_pred, target_names, title_suffix=""):
+def calculate_grouped_rmse(y_true, y_pred, target_names, title_suffix="", return_metrics=False):
     print("\n" + "="*70 + f"\nGROUPED RMSE METRICS {title_suffix}\n" + "="*70)
+    
+    metrics = {}
 
     # Contact location
     contact_indices = [i for i, name in enumerate(target_names) if name in ['x', 'y']]
@@ -352,6 +430,9 @@ def calculate_grouped_rmse(y_true, y_pred, target_names, title_suffix=""):
         print(f"  - Component-wise RMSE: {contact_location_rmse:.4f} mm")
         print(f"  - Euclidean RMSE:      {contact_euclidean_rmse:.4f} mm")
         print(f"  - Mean error distance: {np.mean(contact_euclidean_errors):.4f} mm")
+        
+        metrics['contact_location_rmse'] = contact_location_rmse
+        metrics['contact_euclidean_rmse'] = contact_euclidean_rmse
 
     # Force vector
     force_indices = [i for i, name in enumerate(target_names) if name in ['fx', 'fy', 'fz']]
@@ -369,6 +450,12 @@ def calculate_grouped_rmse(y_true, y_pred, target_names, title_suffix=""):
         print(f"  - Component-wise RMSE: {force_vector_rmse:.4f} N")
         print(f"  - Euclidean RMSE:      {force_euclidean_rmse:.4f} N")
         print(f"  - Mean error magnitude: {np.mean(force_euclidean_errors):.4f} N")
+        
+        metrics['force_vector_rmse'] = force_vector_rmse
+        metrics['force_euclidean_rmse'] = force_euclidean_rmse
+    
+    if return_metrics:
+        return metrics
 
 
 def evaluate_constrained_region(y_test, y_pred, target_cols, x_range=10, y_range=8):
@@ -417,6 +504,188 @@ def evaluate_constrained_region(y_test, y_pred, target_cols, x_range=10, y_range
     return mask
 
 
+def plot_window_size_comparison(window_sizes, results, target_cols):
+    """
+    Plot comparison of error metrics across different window sizes.
+    Both curves on the same plot with dual y-axes:
+    - Left y-axis: Contact position error (x, y) in mm
+    - Right y-axis: 3-DOF force error (fx, fy, fz) in N
+    
+    Args:
+        window_sizes: List of window sizes tested
+        results: Dict mapping window_size -> {'contact_rmse': float, 'force_rmse': float}
+        target_cols: List of target column names
+    """
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+    
+    # Extract metrics
+    contact_rmse = [results[ws]['contact_euclidean_rmse'] for ws in window_sizes]
+    force_rmse = [results[ws]['force_euclidean_rmse'] for ws in window_sizes]
+    
+    # Plot contact position error on left y-axis
+    color1 = 'steelblue'
+    ax1.set_xlabel('Window Size (samples)', fontsize=12)
+    ax1.set_ylabel('Contact Position RMSE (mm)', fontsize=12, color=color1)
+    line1 = ax1.plot(window_sizes, contact_rmse, marker='o', linewidth=2.5, markersize=9, 
+                     color=color1, label='Contact Position Error')
+    ax1.tick_params(axis='y', labelcolor=color1)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xticks(window_sizes)
+    
+    # Annotate best value for contact position
+    best_idx_contact = np.argmin(contact_rmse)
+    ax1.scatter([window_sizes[best_idx_contact]], [contact_rmse[best_idx_contact]], 
+                color='red', s=200, zorder=5, marker='*', edgecolors='darkred', linewidths=1.5)
+    
+    # Create second y-axis for force error
+    ax2 = ax1.twinx()
+    color2 = 'darkorange'
+    ax2.set_ylabel('3-DOF Force RMSE (N)', fontsize=12, color=color2)
+    line2 = ax2.plot(window_sizes, force_rmse, marker='s', linewidth=2.5, markersize=9, 
+                     color=color2, label='Force Error')
+    ax2.tick_params(axis='y', labelcolor=color2)
+    
+    # Annotate best value for force
+    best_idx_force = np.argmin(force_rmse)
+    ax2.scatter([window_sizes[best_idx_force]], [force_rmse[best_idx_force]], 
+                color='red', s=200, zorder=5, marker='*', edgecolors='darkred', linewidths=1.5)
+    
+    # Combined legend
+    lines = line1 + line2
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='upper center', bbox_to_anchor=(0.5, -0.12), 
+               ncol=2, fontsize=11, frameon=True, shadow=True)
+    
+    plt.title('Window Size Hyperparameter Study', fontsize=14, fontweight='bold', pad=15)
+    fig.tight_layout()
+    
+    return fig
+
+
+def plot_learning_rate_comparison(configs, results_position, results_force):
+    """
+    Plot comparison of error metrics across different learning rate configurations.
+    Both curves on the same plot with dual y-axes:
+    - Left y-axis: Contact position error (x, y) in mm
+    - Right y-axis: 3-DOF force error (fx, fy, fz) in N
+    
+    Args:
+        configs: List of dicts with 'learning_rate' and 'n_estimators'
+        results_position: Dict mapping config_idx -> {'contact_euclidean_rmse': float}
+        results_force: Dict mapping config_idx -> {'force_euclidean_rmse': float}
+    """
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+    
+    # Create labels for x-axis
+    config_labels = [f"LR={c['learning_rate']}\nN={c['n_estimators']}" for c in configs]
+    x_pos = np.arange(len(configs))
+    
+    # Extract metrics
+    contact_rmse = [results_position[i]['contact_euclidean_rmse'] for i in range(len(configs))]
+    force_rmse = [results_force[i]['force_euclidean_rmse'] for i in range(len(configs))]
+    
+    # Plot contact position error on left y-axis
+    color1 = 'steelblue'
+    ax1.set_xlabel('Learning Rate Configuration', fontsize=12)
+    ax1.set_ylabel('Contact Position RMSE (mm)', fontsize=12, color=color1)
+    line1 = ax1.plot(x_pos, contact_rmse, marker='o', linewidth=2.5, markersize=9, 
+                     color=color1, label='Contact Position Error')
+    ax1.tick_params(axis='y', labelcolor=color1)
+    ax1.grid(True, alpha=0.3, axis='y')
+    ax1.set_xticks(x_pos)
+    ax1.set_xticklabels(config_labels, fontsize=9)
+    
+    # Annotate best value for contact position
+    best_idx_contact = np.argmin(contact_rmse)
+    ax1.scatter([x_pos[best_idx_contact]], [contact_rmse[best_idx_contact]], 
+                color='red', s=200, zorder=5, marker='*', edgecolors='darkred', linewidths=1.5)
+    
+    # Create second y-axis for force error
+    ax2 = ax1.twinx()
+    color2 = 'darkorange'
+    ax2.set_ylabel('3-DOF Force RMSE (N)', fontsize=12, color=color2)
+    line2 = ax2.plot(x_pos, force_rmse, marker='s', linewidth=2.5, markersize=9, 
+                     color=color2, label='Force Error')
+    ax2.tick_params(axis='y', labelcolor=color2)
+    
+    # Annotate best value for force
+    best_idx_force = np.argmin(force_rmse)
+    ax2.scatter([x_pos[best_idx_force]], [force_rmse[best_idx_force]], 
+                color='red', s=200, zorder=5, marker='*', edgecolors='darkred', linewidths=1.5)
+    
+    # Combined legend
+    lines = line1 + line2
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='upper center', bbox_to_anchor=(0.5, -0.15), 
+               ncol=2, fontsize=11, frameon=True, shadow=True)
+    
+    plt.title('Learning Rate & N_Estimators Hyperparameter Study', fontsize=14, fontweight='bold', pad=15)
+    fig.tight_layout()
+    
+    return fig
+
+
+def plot_num_leaves_comparison(num_leaves_list, results_position, results_force):
+    """
+    Plot comparison of error metrics across different num_leaves values.
+    Both curves on the same plot with dual y-axes:
+    - Left y-axis: Contact position error (x, y) in mm
+    - Right y-axis: 3-DOF force error (fx, fy, fz) in N
+    
+    Args:
+        num_leaves_list: List of num_leaves values tested
+        results_position: Dict mapping idx -> {'contact_euclidean_rmse': float}
+        results_force: Dict mapping idx -> {'force_euclidean_rmse': float}
+    """
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+    
+    x_pos = np.arange(len(num_leaves_list))
+    
+    # Extract metrics
+    contact_rmse = [results_position[i]['contact_euclidean_rmse'] for i in range(len(num_leaves_list))]
+    force_rmse = [results_force[i]['force_euclidean_rmse'] for i in range(len(num_leaves_list))]
+    
+    # Plot contact position error on left y-axis
+    color1 = 'steelblue'
+    ax1.set_xlabel('num_leaves', fontsize=12)
+    ax1.set_ylabel('Contact Position RMSE (mm)', fontsize=12, color=color1)
+    line1 = ax1.plot(x_pos, contact_rmse, marker='o', linewidth=2.5, markersize=9, 
+                     color=color1, label='Contact Position Error')
+    ax1.tick_params(axis='y', labelcolor=color1)
+    ax1.grid(True, alpha=0.3, axis='y')
+    ax1.set_xticks(x_pos)
+    ax1.set_xticklabels([str(nl) for nl in num_leaves_list], fontsize=10)
+    
+    # Annotate best value for contact position
+    best_idx_contact = np.argmin(contact_rmse)
+    ax1.scatter([x_pos[best_idx_contact]], [contact_rmse[best_idx_contact]], 
+                color='red', s=200, zorder=5, marker='*', edgecolors='darkred', linewidths=1.5)
+    
+    # Create second y-axis for force error
+    ax2 = ax1.twinx()
+    color2 = 'darkorange'
+    ax2.set_ylabel('3-DOF Force RMSE (N)', fontsize=12, color=color2)
+    line2 = ax2.plot(x_pos, force_rmse, marker='s', linewidth=2.5, markersize=9, 
+                     color=color2, label='Force Error')
+    ax2.tick_params(axis='y', labelcolor=color2)
+    
+    # Annotate best value for force
+    best_idx_force = np.argmin(force_rmse)
+    ax2.scatter([x_pos[best_idx_force]], [force_rmse[best_idx_force]], 
+                color='red', s=200, zorder=5, marker='*', edgecolors='darkred', linewidths=1.5)
+    
+    # Combined legend
+    lines = line1 + line2
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='upper center', bbox_to_anchor=(0.5, -0.12), 
+               ncol=2, fontsize=11, frameon=True, shadow=True)
+    
+    plt.title('num_leaves Hyperparameter Study', fontsize=14, fontweight='bold', pad=15)
+    fig.tight_layout()
+    
+    return fig
+
+
 # ============================================================
 # ======================== MAIN ==============================
 # ============================================================
@@ -424,30 +693,497 @@ def evaluate_constrained_region(y_test, y_pred, target_cols, x_range=10, y_range
 def main():
     # ---------- Load data ----------
     train_path = os.path.join(DATA_DIRECTORY, TRAIN_FILENAME)
+    val_path   = os.path.join(DATA_DIRECTORY, VALIDATION_FILENAME)
     test_path  = os.path.join(DATA_DIRECTORY, TEST_FILENAME)
 
     if not os.path.exists(train_path):
         raise FileNotFoundError(f"Train data file not found: {train_path}")
+    if not os.path.exists(val_path):
+        raise FileNotFoundError(f"Validation data file not found: {val_path}")
     if not os.path.exists(test_path):
         raise FileNotFoundError(f"Test data file not found: {test_path}")
 
     train_df = pd.read_csv(train_path, skipinitialspace=True)
     train_df.columns = train_df.columns.str.strip()
 
+    val_df = pd.read_csv(val_path, skipinitialspace=True)
+    val_df.columns = val_df.columns.str.strip()
+
     test_df = pd.read_csv(test_path, skipinitialspace=True)
     test_df.columns = test_df.columns.str.strip()
 
     print("Loaded train data with columns:", train_df.columns.tolist())
+    print("Loaded validation data with columns:", val_df.columns.tolist())
     print("Loaded test data with columns:", test_df.columns.tolist())
-    print(f"Train samples: {len(train_df)}, Test samples: {len(test_df)}")
+    print(f"Train samples: {len(train_df)}, Validation samples: {len(val_df)}, Test samples: {len(test_df)}")
+
+    # Convert sentinel values to NaN if enabled
+    if CONVERT_SENTINEL_TO_NAN:
+        print("\nConverting sentinel values to NaN in target columns...")
+        train_df = convert_sentinel_to_nan(train_df, TARGET_COLS, NO_CONTACT_SENTINEL)
+        val_df = convert_sentinel_to_nan(val_df, TARGET_COLS, NO_CONTACT_SENTINEL)
+        test_df = convert_sentinel_to_nan(test_df, TARGET_COLS, NO_CONTACT_SENTINEL)
 
     needed_cols = [TIME_COL] + BARO_COLS + TARGET_COLS
     train_df = train_df.dropna(subset=needed_cols).reset_index(drop=True)
+    val_df   = val_df.dropna(subset=needed_cols).reset_index(drop=True)
     test_df  = test_df.dropna(subset=needed_cols).reset_index(drop=True)
 
-    # ---------- Build windowed feature matrices ----------
+    # ---------- Window Size Study or Single Run ----------
+    if RUN_WINDOW_SIZE_STUDY:
+        print("\n" + "="*70)
+        print("RUNNING WINDOW SIZE HYPERPARAMETER STUDY")
+        print(f"Testing window sizes: {WINDOW_SIZES}")
+        print("="*70)
+        
+        window_size_results = {}
+        
+        for ws in WINDOW_SIZES:
+            print(f"\n{'='*70}")
+            print(f"Testing Window Size: {ws}")
+            print(f"{'='*70}")
+            
+            # Build features for this window size
+            X_train_ws, y_train_ws, _, _ = build_window_features(
+                train_df, BARO_COLS, TIME_COL, TARGET_COLS, ws,
+                use_second_derivative=USE_SECOND_DERIVATIVE
+            )
+            X_val_ws, y_val_ws, _, _ = build_window_features(
+                val_df, BARO_COLS, TIME_COL, TARGET_COLS, ws,
+                use_second_derivative=USE_SECOND_DERIVATIVE
+            )
+            X_test_ws, y_test_ws, _, _ = build_window_features(
+                test_df, BARO_COLS, TIME_COL, TARGET_COLS, ws,
+                use_second_derivative=USE_SECOND_DERIVATIVE
+            )
+            
+            # Normalize
+            scaler_ws = StandardScaler()
+            X_train_ws = scaler_ws.fit_transform(X_train_ws)
+            X_val_ws = scaler_ws.transform(X_val_ws)
+            X_test_ws = scaler_ws.transform(X_test_ws)
+            
+            # Train model (use the enabled model)
+            if USE_LIGHTGBM and HAVE_LIGHTGBM:
+                lgbm_models_ws = []
+                lgbm_preds_ws = []
+                
+                for i, target in enumerate(TARGET_COLS):
+                    lgbm = LGBMRegressor(
+                        n_estimators=300,
+                        learning_rate=0.1,
+                        num_leaves=31,
+                        subsample=0.8,
+                        colsample_bytree=0.8,
+                        random_state=RANDOM_STATE,
+                        n_jobs=-1,
+                        verbose=-1,
+                        metric='mse',
+                    )
+                    lgbm.fit(X_train_ws, y_train_ws[:, i],
+                            eval_set=[(X_val_ws, y_val_ws[:, i])],
+                            eval_names=['valid'])
+                    lgbm_models_ws.append(lgbm)
+                    lgbm_preds_ws.append(lgbm.predict(X_test_ws))
+                
+                y_pred_ws = np.column_stack(lgbm_preds_ws)
+                
+            elif USE_XGBOOST and HAVE_XGBOOST:
+                xgb_models_ws = []
+                xgb_preds_ws = []
+                
+                for i, target in enumerate(TARGET_COLS):
+                    xgb = XGBRegressor(
+                        n_estimators=300,
+                        learning_rate=0.1,
+                        max_depth=6,
+                        subsample=0.8,
+                        colsample_bytree=0.8,
+                        random_state=RANDOM_STATE,
+                        n_jobs=-1,
+                        verbosity=0,
+                        eval_metric='rmse'
+                    )
+                    xgb.fit(X_train_ws, y_train_ws[:, i],
+                           eval_set=[(X_val_ws, y_val_ws[:, i])],
+                           verbose=False)
+                    xgb_models_ws.append(xgb)
+                    xgb_preds_ws.append(xgb.predict(X_test_ws))
+                
+                y_pred_ws = np.column_stack(xgb_preds_ws)
+                
+            elif USE_RANDOM_FOREST:
+                rf_models_ws = []
+                rf_preds_ws = []
+                
+                for i, target in enumerate(TARGET_COLS):
+                    rf = RandomForestRegressor(
+                        n_estimators=100,
+                        max_depth=20,
+                        min_samples_split=5,
+                        min_samples_leaf=2,
+                        random_state=RANDOM_STATE,
+                        n_jobs=-1,
+                        verbose=0
+                    )
+                    rf.fit(X_train_ws, y_train_ws[:, i])
+                    rf_models_ws.append(rf)
+                    rf_preds_ws.append(rf.predict(X_test_ws))
+                
+                y_pred_ws = np.column_stack(rf_preds_ws)
+            else:
+                raise ValueError("No model enabled for window size study. Enable at least one model.")
+            
+            # Evaluate and store results
+            metrics = calculate_grouped_rmse(y_test_ws, y_pred_ws, TARGET_COLS, 
+                                            title_suffix=f"Window Size = {ws}",
+                                            return_metrics=True)
+            window_size_results[ws] = metrics
+        
+        # Plot comparison
+        print("\n" + "="*70)
+        print("GENERATING WINDOW SIZE COMPARISON PLOT")
+        print("="*70)
+        
+        fig_comparison = plot_window_size_comparison(WINDOW_SIZES, window_size_results, TARGET_COLS)
+        
+        save_dir = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\models parameters\averaged models"
+        os.makedirs(save_dir, exist_ok=True)
+        version = f'v{sensor_version:.2f}'
+        
+        comparison_path = os.path.join(save_dir, f'window_size_comparison_{version}.png')
+        fig_comparison.savefig(comparison_path, bbox_inches='tight', dpi=300)
+        plt.show()
+        print(f"Window size comparison plot saved to: {comparison_path}")
+        
+        # Print summary
+        print("\n" + "="*70)
+        print("WINDOW SIZE STUDY SUMMARY")
+        print("="*70)
+        print(f"{'Window Size':<15} {'Contact RMSE (mm)':<20} {'Force RMSE (N)':<20}")
+        print("-" * 70)
+        for ws in WINDOW_SIZES:
+            contact_rmse = window_size_results[ws]['contact_euclidean_rmse']
+            force_rmse = window_size_results[ws]['force_euclidean_rmse']
+            print(f"{ws:<15} {contact_rmse:<20.4f} {force_rmse:<20.4f}")
+        
+        # Find best window sizes
+        best_ws_contact = min(WINDOW_SIZES, key=lambda ws: window_size_results[ws]['contact_euclidean_rmse'])
+        best_ws_force = min(WINDOW_SIZES, key=lambda ws: window_size_results[ws]['force_euclidean_rmse'])
+        
+        print("\n" + "="*70)
+        print(f"Best window size for contact position: {best_ws_contact}")
+        print(f"Best window size for force: {best_ws_force}")
+        print("="*70)
+        
+        print("\nWindow size study complete. Exiting.")
+        return
+    
+    # ---------- Learning Rate & N_Estimators Study ----------
+    if RUN_LEARNING_RATE_STUDY:
+        print("\n" + "="*70)
+        print("RUNNING LEARNING RATE & N_ESTIMATORS HYPERPARAMETER STUDY")
+        print(f"Testing {len(LEARNING_RATE_CONFIGS)} configurations")
+        print("="*70)
+        
+        # Build features once with selected window size
+        X_train_lr, y_train_lr, _, _ = build_window_features(
+            train_df, BARO_COLS, TIME_COL, TARGET_COLS, WINDOW_SIZE,
+            use_second_derivative=USE_SECOND_DERIVATIVE
+        )
+        X_val_lr, y_val_lr, _, _ = build_window_features(
+            val_df, BARO_COLS, TIME_COL, TARGET_COLS, WINDOW_SIZE,
+            use_second_derivative=USE_SECOND_DERIVATIVE
+        )
+        X_test_lr, y_test_lr, _, _ = build_window_features(
+            test_df, BARO_COLS, TIME_COL, TARGET_COLS, WINDOW_SIZE,
+            use_second_derivative=USE_SECOND_DERIVATIVE
+        )
+        
+        # Normalize
+        scaler_lr = StandardScaler()
+        X_train_lr = scaler_lr.fit_transform(X_train_lr)
+        X_val_lr = scaler_lr.transform(X_val_lr)
+        X_test_lr = scaler_lr.transform(X_test_lr)
+        
+        lr_results_position = {}
+        lr_results_force = {}
+        
+        for config_idx, config in enumerate(LEARNING_RATE_CONFIGS):
+            lr = config['learning_rate']
+            n_est = config['n_estimators']
+            
+            print(f"\n{'='*70}")
+            print(f"Testing Config {config_idx + 1}/{len(LEARNING_RATE_CONFIGS)}: LR={lr}, N_estimators={n_est}")
+            print(f"{'='*70}")
+            
+            if USE_LIGHTGBM and HAVE_LIGHTGBM:
+                # Train position models (x, y)
+                position_preds = []
+                for i, target in enumerate(['x', 'y']):
+                    target_idx = TARGET_COLS.index(target)
+                    lgbm = LGBMRegressor(
+                        n_estimators=n_est,
+                        learning_rate=lr,
+                        num_leaves=31,
+                        subsample=0.8,
+                        colsample_bytree=0.8,
+                        random_state=RANDOM_STATE,
+                        n_jobs=-1,
+                        verbose=-1,
+                        metric='mse',
+                    )
+                    lgbm.fit(X_train_lr, y_train_lr[:, target_idx],
+                            eval_set=[(X_val_lr, y_val_lr[:, target_idx])],
+                            eval_names=['valid'])
+                    position_preds.append(lgbm.predict(X_test_lr))
+                
+                y_pred_position = np.column_stack(position_preds)
+                y_test_position = y_test_lr[:, [TARGET_COLS.index('x'), TARGET_COLS.index('y')]]
+                
+                # Calculate position metrics
+                metrics_pos = calculate_grouped_rmse(
+                    y_test_position, y_pred_position, ['x', 'y'],
+                    title_suffix=f"Position - LR={lr}, N={n_est}",
+                    return_metrics=True
+                )
+                lr_results_position[config_idx] = metrics_pos
+                
+                # Train force models (fx, fy, fz)
+                force_preds = []
+                for i, target in enumerate(['fx', 'fy', 'fz']):
+                    target_idx = TARGET_COLS.index(target)
+                    lgbm = LGBMRegressor(
+                        n_estimators=n_est,
+                        learning_rate=lr,
+                        num_leaves=31,
+                        subsample=0.8,
+                        colsample_bytree=0.8,
+                        random_state=RANDOM_STATE,
+                        n_jobs=-1,
+                        verbose=-1,
+                        metric='mse',
+                    )
+                    lgbm.fit(X_train_lr, y_train_lr[:, target_idx],
+                            eval_set=[(X_val_lr, y_val_lr[:, target_idx])],
+                            eval_names=['valid'])
+                    force_preds.append(lgbm.predict(X_test_lr))
+                
+                y_pred_force = np.column_stack(force_preds)
+                y_test_force = y_test_lr[:, [TARGET_COLS.index('fx'), TARGET_COLS.index('fy'), TARGET_COLS.index('fz')]]
+                
+                # Calculate force metrics
+                metrics_force = calculate_grouped_rmse(
+                    y_test_force, y_pred_force, ['fx', 'fy', 'fz'],
+                    title_suffix=f"Force - LR={lr}, N={n_est}",
+                    return_metrics=True
+                )
+                lr_results_force[config_idx] = metrics_force
+                
+            else:
+                raise ValueError("LightGBM must be enabled for learning rate study.")
+        
+        # Plot comparison
+        print("\n" + "="*70)
+        print("GENERATING LEARNING RATE COMPARISON PLOT")
+        print("="*70)
+        
+        fig_lr_comparison = plot_learning_rate_comparison(LEARNING_RATE_CONFIGS, lr_results_position, lr_results_force)
+        
+        save_dir = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\models parameters\averaged models"
+        os.makedirs(save_dir, exist_ok=True)
+        version = f'v{sensor_version:.2f}'
+        
+        lr_comparison_path = os.path.join(save_dir, f'learning_rate_comparison_{version}.png')
+        fig_lr_comparison.savefig(lr_comparison_path, bbox_inches='tight', dpi=300)
+        plt.show()
+        print(f"Learning rate comparison plot saved to: {lr_comparison_path}")
+        
+        # Print summary
+        print("\n" + "="*70)
+        print("LEARNING RATE STUDY SUMMARY")
+        print("="*70)
+        print(f"{'Config':<25} {'Contact RMSE (mm)':<20} {'Force RMSE (N)':<20}")
+        print("-" * 70)
+        for idx, config in enumerate(LEARNING_RATE_CONFIGS):
+            lr = config['learning_rate']
+            n_est = config['n_estimators']
+            contact_rmse = lr_results_position[idx]['contact_euclidean_rmse']
+            force_rmse = lr_results_force[idx]['force_euclidean_rmse']
+            print(f"LR={lr}, N={n_est:<7} {contact_rmse:<20.4f} {force_rmse:<20.4f}")
+        
+        # Find best configurations
+        best_config_contact = min(range(len(LEARNING_RATE_CONFIGS)), 
+                                 key=lambda i: lr_results_position[i]['contact_euclidean_rmse'])
+        best_config_force = min(range(len(LEARNING_RATE_CONFIGS)), 
+                               key=lambda i: lr_results_force[i]['force_euclidean_rmse'])
+        
+        print("\n" + "="*70)
+        print(f"Best config for contact position: LR={LEARNING_RATE_CONFIGS[best_config_contact]['learning_rate']}, "
+              f"N={LEARNING_RATE_CONFIGS[best_config_contact]['n_estimators']}")
+        print(f"Best config for force: LR={LEARNING_RATE_CONFIGS[best_config_force]['learning_rate']}, "
+              f"N={LEARNING_RATE_CONFIGS[best_config_force]['n_estimators']}")
+        print("="*70)
+        
+        print("\nLearning rate study complete. Exiting.")
+        return
+    
+    # ---------- num_leaves Study ----------
+    if RUN_NUM_LEAVES_STUDY:
+        print("\n" + "="*70)
+        print("RUNNING NUM_LEAVES HYPERPARAMETER STUDY")
+        print("="*70)
+        print(f"Testing {len(NUM_LEAVES_CONFIGS)} different num_leaves values: {NUM_LEAVES_CONFIGS}")
+        print(f"Using window size: {WINDOW_SIZE}")
+        print(f"Using optimized learning rates:")
+        print(f"  Position: LR={LR_POSITION}, N={N_EST_POSITION}")
+        print(f"  Force: LR={LR_FORCE}, N={N_EST_FORCE}")
+        
+        # Build features once with the default window size
+        X_train_nl, y_train_nl, _, _ = build_window_features(
+            train_df, BARO_COLS, TIME_COL, TARGET_COLS, WINDOW_SIZE,
+            use_second_derivative=USE_SECOND_DERIVATIVE
+        )
+        X_val_nl, y_val_nl, _, _ = build_window_features(
+            val_df, BARO_COLS, TIME_COL, TARGET_COLS, WINDOW_SIZE,
+            use_second_derivative=USE_SECOND_DERIVATIVE
+        )
+        X_test_nl, y_test_nl, _, _ = build_window_features(
+            test_df, BARO_COLS, TIME_COL, TARGET_COLS, WINDOW_SIZE,
+            use_second_derivative=USE_SECOND_DERIVATIVE
+        )
+        
+        # Normalize
+        scaler_nl = StandardScaler()
+        X_train_nl = scaler_nl.fit_transform(X_train_nl)
+        X_val_nl = scaler_nl.transform(X_val_nl)
+        X_test_nl = scaler_nl.transform(X_test_nl)
+        
+        nl_results_position = {}
+        nl_results_force = {}
+        
+        for nl_idx, num_leaves_val in enumerate(NUM_LEAVES_CONFIGS):
+            print(f"\n{'='*70}")
+            print(f"Testing Config {nl_idx + 1}/{len(NUM_LEAVES_CONFIGS)}: num_leaves={num_leaves_val}")
+            print(f"{'='*70}")
+            
+            if USE_LIGHTGBM and HAVE_LIGHTGBM:
+                # Train position models (x, y)
+                position_preds = []
+                for i, target in enumerate(['x', 'y']):
+                    target_idx = TARGET_COLS.index(target)
+                    lgbm = LGBMRegressor(
+                        n_estimators=N_EST_POSITION,
+                        learning_rate=LR_POSITION,
+                        num_leaves=num_leaves_val,
+                        subsample=0.8,
+                        colsample_bytree=0.8,
+                        random_state=RANDOM_STATE,
+                        n_jobs=-1,
+                        verbose=-1,
+                        metric='mse',
+                    )
+                    lgbm.fit(X_train_nl, y_train_nl[:, target_idx],
+                            eval_set=[(X_val_nl, y_val_nl[:, target_idx])],
+                            eval_names=['valid'])
+                    position_preds.append(lgbm.predict(X_test_nl))
+                
+                y_pred_position = np.column_stack(position_preds)
+                y_test_position = y_test_nl[:, [TARGET_COLS.index('x'), TARGET_COLS.index('y')]]
+                
+                # Calculate position metrics
+                metrics_pos = calculate_grouped_rmse(
+                    y_test_position, y_pred_position, ['x', 'y'],
+                    title_suffix=f"Position - num_leaves={num_leaves_val}",
+                    return_metrics=True
+                )
+                nl_results_position[nl_idx] = metrics_pos
+                
+                # Train force models (fx, fy, fz)
+                force_preds = []
+                for i, target in enumerate(['fx', 'fy', 'fz']):
+                    target_idx = TARGET_COLS.index(target)
+                    lgbm = LGBMRegressor(
+                        n_estimators=N_EST_FORCE,
+                        learning_rate=LR_FORCE,
+                        num_leaves=num_leaves_val,
+                        subsample=0.8,
+                        colsample_bytree=0.8,
+                        random_state=RANDOM_STATE,
+                        n_jobs=-1,
+                        verbose=-1,
+                        metric='mse',
+                    )
+                    lgbm.fit(X_train_nl, y_train_nl[:, target_idx],
+                            eval_set=[(X_val_nl, y_val_nl[:, target_idx])],
+                            eval_names=['valid'])
+                    force_preds.append(lgbm.predict(X_test_nl))
+                
+                y_pred_force = np.column_stack(force_preds)
+                y_test_force = y_test_nl[:, [TARGET_COLS.index('fx'), TARGET_COLS.index('fy'), TARGET_COLS.index('fz')]]
+                
+                # Calculate force metrics
+                metrics_force = calculate_grouped_rmse(
+                    y_test_force, y_pred_force, ['fx', 'fy', 'fz'],
+                    title_suffix=f"Force - num_leaves={num_leaves_val}",
+                    return_metrics=True
+                )
+                nl_results_force[nl_idx] = metrics_force
+                
+            else:
+                raise ValueError("LightGBM must be enabled for num_leaves study.")
+        
+        # Plot comparison
+        print("\n" + "="*70)
+        print("GENERATING NUM_LEAVES COMPARISON PLOT")
+        print("="*70)
+        
+        fig_nl_comparison = plot_num_leaves_comparison(NUM_LEAVES_CONFIGS, nl_results_position, nl_results_force)
+        
+        save_dir = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\models parameters\averaged models"
+        os.makedirs(save_dir, exist_ok=True)
+        version = f'v{sensor_version:.2f}'
+        
+        nl_comparison_path = os.path.join(save_dir, f'num_leaves_comparison_{version}.png')
+        fig_nl_comparison.savefig(nl_comparison_path, bbox_inches='tight', dpi=300)
+        plt.show()
+        print(f"num_leaves comparison plot saved to: {nl_comparison_path}")
+        
+        # Print summary
+        print("\n" + "="*70)
+        print("NUM_LEAVES STUDY SUMMARY")
+        print("="*70)
+        print(f"{'num_leaves':<15} {'Contact RMSE (mm)':<20} {'Force RMSE (N)':<20}")
+        print("-" * 70)
+        for idx, num_leaves_val in enumerate(NUM_LEAVES_CONFIGS):
+            contact_rmse = nl_results_position[idx]['contact_euclidean_rmse']
+            force_rmse = nl_results_force[idx]['force_euclidean_rmse']
+            print(f"{num_leaves_val:<15} {contact_rmse:<20.4f} {force_rmse:<20.4f}")
+        
+        # Find best configurations
+        best_nl_contact = NUM_LEAVES_CONFIGS[min(range(len(NUM_LEAVES_CONFIGS)), 
+                                 key=lambda i: nl_results_position[i]['contact_euclidean_rmse'])]
+        best_nl_force = NUM_LEAVES_CONFIGS[min(range(len(NUM_LEAVES_CONFIGS)), 
+                               key=lambda i: nl_results_force[i]['force_euclidean_rmse'])]
+        
+        print("\n" + "="*70)
+        print(f"Best num_leaves for contact position: {best_nl_contact}")
+        print(f"Best num_leaves for force: {best_nl_force}")
+        print("="*70)
+        
+        print("\nnum_leaves study complete. Exiting.")
+        return
+    
+    # ---------- Single Window Size Run ----------
+    print(f"\nUsing single window size: {WINDOW_SIZE}")
+    
+    # Build windowed feature matrices
     X_train, y_train, train_center, feat_names = build_window_features(
         train_df, BARO_COLS, TIME_COL, TARGET_COLS, WINDOW_SIZE, 
+        use_second_derivative=USE_SECOND_DERIVATIVE
+    )
+    X_val, y_val, val_center, _ = build_window_features(
+        val_df, BARO_COLS, TIME_COL, TARGET_COLS, WINDOW_SIZE,
         use_second_derivative=USE_SECOND_DERIVATIVE
     )
     X_test, y_test, test_center, _ = build_window_features(
@@ -457,11 +1193,13 @@ def main():
 
     print(f"Engineered {X_train.shape[1]} features "
           f"(window size = {WINDOW_SIZE}, denoising = {APPLY_DENOISING}).")
+    print(f"Feature matrix shapes: Train={X_train.shape}, Val={X_val.shape}, Test={X_test.shape}")
 
     # ---------- Normalize features ----------
     print("\nNormalizing features using StandardScaler...")
     scaler = StandardScaler()
     X_train = scaler.fit_transform(X_train)
+    X_val   = scaler.transform(X_val)
     X_test  = scaler.transform(X_test)
     print("Features normalized (mean=0, std=1)")
 
@@ -518,7 +1256,7 @@ def main():
 
             xgb.fit(
                 X_train, y_train[:, i],
-                eval_set=[(X_train, y_train[:, i]), (X_test, y_test[:, i])],
+                eval_set=[(X_train, y_train[:, i]), (X_val, y_val[:, i])],
                 verbose=False
             )
 
@@ -540,16 +1278,32 @@ def main():
 
     if USE_LIGHTGBM and HAVE_LIGHTGBM:
         print("\nTraining LightGBM (multi-output: one model per target)...")
+        print(f"Using separate hyperparameters for position and force:")
+        print(f"  Position (x, y): LR={LR_POSITION}, N_estimators={N_EST_POSITION}, num_leaves={NUM_LEAVES_POSITION}")
+        print(f"  Force (fx, fy, fz): LR={LR_FORCE}, N_estimators={N_EST_FORCE}, num_leaves={NUM_LEAVES_FORCE}")
+        
         lgbm_models = []
         lgbm_preds  = []
         lgbm_loss_history = {}
 
         for i, target in enumerate(TARGET_COLS):
-            print(f"  Training model for target: {target}")
+            # Select hyperparameters based on target type
+            if target in ['x', 'y']:
+                lr = LR_POSITION
+                n_est = N_EST_POSITION
+                num_leaves_val = NUM_LEAVES_POSITION
+                target_type = "position"
+            else:  # fx, fy, fz
+                lr = LR_FORCE
+                n_est = N_EST_FORCE
+                num_leaves_val = NUM_LEAVES_FORCE
+                target_type = "force"
+            
+            print(f"  Training model for target: {target} ({target_type}) - LR={lr}, N={n_est}, num_leaves={num_leaves_val}")
             lgbm = LGBMRegressor(
-                n_estimators=300,
-                learning_rate=0.1,
-                num_leaves=31,
+                n_estimators=n_est,
+                learning_rate=lr,
+                num_leaves=num_leaves_val,
                 subsample=0.8,
                 colsample_bytree=0.8,
                 random_state=RANDOM_STATE,
@@ -560,7 +1314,7 @@ def main():
 
             lgbm.fit(
                 X_train, y_train[:, i],
-                eval_set=[(X_train, y_train[:, i]), (X_test, y_test[:, i])],
+                eval_set=[(X_train, y_train[:, i]), (X_val, y_val[:, i])],
                 eval_names=['train', 'valid'],
             )
 
@@ -597,7 +1351,7 @@ def main():
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(save_dir_comparison, exist_ok=True)
 
-    version = f'v{sensor_version:.2f}'
+    version = f'v{sensor_version:.3f}'
     
     # Save scaler
     scaler_path = os.path.join(save_dir, f'scaler_sliding_window_{version}.pkl')

@@ -14,8 +14,8 @@ from matplotlib.ticker import ScalarFormatter
 # ============================================================
 # === USER SETTINGS ==========================================
 # ============================================================
-test_num = 4900
-version_num = 4
+test_num = 51305
+version_num = 5
 file_name = f"{test_num}barometers_trial.txt" # or f"barometers_trial{test_num}.txt"
 directory_to_datasets = os.path.abspath(
     fr"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data\test {test_num} - sensor v{version_num}"
