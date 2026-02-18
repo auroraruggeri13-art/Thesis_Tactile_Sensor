@@ -34,23 +34,28 @@ DATASET_DIR = Path(
 )
 
 # --- Data ---
-SEQ_LEN = 8            # Number of consecutive frames per sequence
-IMAGE_SIZE = 224        # Resize for ResNet input
-TARGETS = ["fx", "fy", "fz"]
+SEQ_LEN = 4            # Number of consecutive frames per sequence
+IMAGE_SIZE = 112        # Resize for ResNet input (use 224 for full training)
+TARGETS = ["fx_R", "fy_R", "fz_R", "fx_L", "fy_L", "fz_L"]
 
 # --- Model ---
+USE_LSTM = True        # True = LSTM, False = Transformer
 D_MODEL = 512           # ResNet18 feature dim (fixed)
 N_HEADS = 4
 N_TRANSFORMER_LAYERS = 4
 DIM_FEEDFORWARD = 1024
 DROPOUT = 0.1
 
+# --- LSTM-specific ---
+LSTM_HIDDEN_SIZE = 256
+LSTM_NUM_LAYERS = 2
+
 # --- Training ---
-BATCH_SIZE = 8
-EPOCHS = 100
-LR = 1e-4
+BATCH_SIZE = 16
+EPOCHS = 5
+LR = 1e-3
 WEIGHT_DECAY = 1e-4
-FREEZE_CNN_EPOCHS = 5   # Freeze ResNet backbone for first N epochs
+FREEZE_CNN_EPOCHS = 2   # Freeze ResNet backbone for first N epochs
 EARLY_STOP_PATIENCE = 15
 VAL_SPLIT = 0.2
 
@@ -127,9 +132,39 @@ def preprocess_image(image_bgr: np.ndarray) -> torch.Tensor:
 
 # ========================== IMAGE LOADER ==============================
 
+_ENC_INFO = {
+    'rgb8': (np.uint8, 3),
+    'bgr8': (np.uint8, 3),
+    'rgba8': (np.uint8, 4),
+    'bgra8': (np.uint8, 4),
+    'mono8': (np.uint8, 1),
+    '8UC1': (np.uint8, 1),
+    '8UC3': (np.uint8, 3),
+    '16UC1': (np.uint16, 1),
+}
+
+
+def _raw_to_bgr(data, height, width, encoding):
+    """Convert raw Image data to a BGR numpy array."""
+    info = _ENC_INFO.get(encoding)
+    if info is None:
+        raise ValueError(f"Unsupported encoding: {encoding}")
+    dtype, channels = info
+    img = np.frombuffer(data, dtype=dtype).reshape(height, width, channels)
+    if encoding in ('rgb8',):
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    elif encoding in ('rgba8',):
+        img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+    elif encoding in ('bgra8',):
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    elif encoding in ('mono8', '8UC1'):
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    return img
+
+
 def extract_images_from_bag(bag_path: Path):
     """
-    Extract all CompressedImage frames from a ROS bag with timestamps.
+    Extract all raw Image frames from a ROS bag with timestamps.
 
     Returns:
         List of dicts: {'index', 'image', 'timestamp_sec'}
@@ -138,13 +173,13 @@ def extract_images_from_bag(bag_path: Path):
     images = []
 
     with AnyReader([bag_path]) as reader:
-        # Auto-detect CompressedImage topic
+        # Auto-detect Image topic (raw, not compressed)
         image_connections = [
             c for c in reader.connections
-            if 'CompressedImage' in c.msgtype
+            if c.msgtype in ('sensor_msgs/msg/Image', 'sensor_msgs/Image')
         ]
         if not image_connections:
-            raise ValueError("No CompressedImage topic found in bag file.")
+            raise ValueError("No sensor_msgs/Image topic found in bag file.")
 
         topic = image_connections[0].topic
         print(f"  Using topic: {topic}")
@@ -161,17 +196,16 @@ def extract_images_from_bag(bag_path: Path):
             desc="Extracting images"
         ):
             msg = reader.deserialize(rawdata, connection.msgtype)
-            jpeg_bytes = bytes(msg.data)
-            img_array = np.frombuffer(jpeg_bytes, dtype=np.uint8)
-            image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            image = _raw_to_bgr(
+                bytes(msg.data), msg.height, msg.width, msg.encoding
+            )
 
-            if image is not None:
-                images.append({
-                    'index': idx,
-                    'image': image,
-                    'timestamp_sec': timestamp / 1e9,
-                })
-                idx += 1
+            images.append({
+                'index': idx,
+                'image': image,
+                'timestamp_sec': timestamp / 1e9,
+            })
+            idx += 1
 
     print(f"  Extracted {len(images)} images")
     return images
@@ -329,6 +363,71 @@ class ForcesForFree(nn.Module):
         return out
 
 
+class ForcesForFreeLSTM(nn.Module):
+    """
+    CNN + LSTM model for force prediction from image sequences.
+
+    Architecture:
+        1. Shared ResNet18 backbone (per-frame) -> 512-dim features
+        2. LSTM on the sequence of features
+        3. Last hidden state -> MLP head -> force predictions
+    """
+
+    def __init__(self, num_targets=3, hidden_size=LSTM_HIDDEN_SIZE,
+                 num_layers=LSTM_NUM_LAYERS, dropout=DROPOUT):
+        super().__init__()
+
+        # CNN backbone: ResNet18 without final FC
+        resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        self.cnn = nn.Sequential(*list(resnet.children())[:-1])  # -> (B, 512, 1, 1)
+
+        self.lstm = nn.LSTM(
+            input_size=D_MODEL,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+
+        # Prediction head
+        self.head = nn.Sequential(
+            nn.Linear(hidden_size, 256),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, num_targets),
+        )
+
+    def freeze_cnn(self):
+        for param in self.cnn.parameters():
+            param.requires_grad = False
+
+    def unfreeze_cnn(self):
+        for param in self.cnn.parameters():
+            param.requires_grad = True
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, seq_len, 3, H, W) image sequence
+        Returns:
+            (B, num_targets) force predictions
+        """
+        B, S, C, H, W = x.shape
+
+        x = x.view(B * S, C, H, W)
+        features = self.cnn(x)                   # (B*S, 512, 1, 1)
+        features = features.view(B, S, D_MODEL)  # (B, S, 512)
+
+        # LSTM
+        lstm_out, _ = self.lstm(features)        # (B, S, hidden_size)
+
+        # Take last time step
+        last = lstm_out[:, -1, :]                # (B, hidden_size)
+
+        out = self.head(last)                    # (B, num_targets)
+        return out
+
+
 # =========================== TRAINING =================================
 
 def train_one_epoch(model, loader, optimizer, criterion, device):
@@ -415,9 +514,10 @@ def plot_training_curves(train_losses, val_losses, save_path):
 def plot_predictions_vs_gt(predictions, ground_truth, target_names, save_path):
     """Scatter plots: predicted vs ground truth for each target."""
     n_targets = len(target_names)
-    fig, axes = plt.subplots(1, n_targets, figsize=(5 * n_targets, 5))
-    if n_targets == 1:
-        axes = [axes]
+    n_cols = min(n_targets, 3)
+    n_rows = (n_targets + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 5 * n_rows))
+    axes = np.atleast_2d(axes).flatten()
 
     for i, (ax, name) in enumerate(zip(axes, target_names)):
         pred = predictions[:, i]
@@ -431,10 +531,13 @@ def plot_predictions_vs_gt(predictions, ground_truth, target_names, save_path):
 
         ax.set_xlabel(f'Ground Truth {name}')
         ax.set_ylabel(f'Predicted {name}')
-        unit = 'N'
-        ax.set_title(f'{name} [{unit}]')
+        ax.set_title(f'{name} [N]')
         ax.grid(alpha=0.3)
         ax.set_aspect('equal')
+
+    # Hide unused subplots
+    for j in range(n_targets, len(axes)):
+        axes[j].set_visible(False)
 
     fig.suptitle('Predictions vs Ground Truth', fontsize=14)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
@@ -445,13 +548,14 @@ def plot_predictions_vs_gt(predictions, ground_truth, target_names, save_path):
 # ============================== MAIN ==================================
 
 def main():
+    arch_name = "LSTM" if USE_LSTM else "Transformer"
     print("=" * 60)
     print("FORCES FOR FREE - Vision-Based Force Prediction")
-    print(f"CNN (ResNet18) + Transformer -> [{', '.join(TARGETS)}]")
+    print(f"CNN (ResNet18) + {arch_name} -> [{', '.join(TARGETS)}]")
     print(f"Device: {DEVICE}")
     print("=" * 60)
 
-    bag_file = DATASET_DIR / f"{TEST_NUM}_rgb_compressed.bag"
+    bag_file = DATASET_DIR / f"{TEST_NUM}_rgb_raw.bag"
     metadata_file = DATASET_DIR / "processed_data" / "metadata.csv"
     output_dir = DATASET_DIR / "processed_data"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -485,17 +589,15 @@ def main():
         targets=TARGETS,
     )
 
-    # Train/val split
+    # Chronological train/val split (no shuffling — time series)
     n_val = int(len(dataset) * VAL_SPLIT)
     n_train = len(dataset) - n_val
-    train_dataset, val_dataset = random_split(
-        dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(42)
-    )
-    print(f"  Train: {n_train}, Val: {n_val}")
+    train_dataset = torch.utils.data.Subset(dataset, range(0, n_train))
+    val_dataset = torch.utils.data.Subset(dataset, range(n_train, n_train + n_val))
+    print(f"  Train: {n_train}, Val: {n_val} (chronological split)")
 
     train_loader = DataLoader(
-        train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+        train_dataset, batch_size=BATCH_SIZE, shuffle=False,
         num_workers=0, pin_memory=True,
     )
     val_loader = DataLoader(
@@ -504,11 +606,18 @@ def main():
     )
 
     # 4. Create model
-    print("\n--- Step 4: Create model ---")
-    model = ForcesForFree(
-        num_targets=len(TARGETS),
-        seq_len=SEQ_LEN,
-    ).to(DEVICE)
+    print(f"\n--- Step 4: Create model ({arch_name}) ---")
+    if USE_LSTM:
+        model = ForcesForFreeLSTM(
+            num_targets=len(TARGETS),
+            hidden_size=LSTM_HIDDEN_SIZE,
+            num_layers=LSTM_NUM_LAYERS,
+        ).to(DEVICE)
+    else:
+        model = ForcesForFree(
+            num_targets=len(TARGETS),
+            seq_len=SEQ_LEN,
+        ).to(DEVICE)
 
     n_params = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -533,7 +642,7 @@ def main():
     patience_counter = 0
     train_losses = []
     val_losses = []
-    best_model_path = output_dir / "forces_for_free_best.pt"
+    best_model_path = output_dir / f"forces_for_free_{arch_name.lower()}_best.pt"
 
     for epoch in range(1, EPOCHS + 1):
         # Unfreeze CNN after warmup
