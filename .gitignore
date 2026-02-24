@@ -1,0 +1,13 @@
+# Non tenere file di modelli enormi
+*.pkl
+
+# Cache Python
+__pycache__/
+*.pyc
+
+TactileSensingMasterThesis/Lib/
+TactileSensingMasterThesis/Scripts/
+TactileSensingMasterThesis/pyvenv.cfg
+__pycache__/
+*.pyc
+
