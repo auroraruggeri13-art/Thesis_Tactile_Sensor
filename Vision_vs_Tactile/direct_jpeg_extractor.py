@@ -38,15 +38,15 @@ from hsv_color_picker import pick_hsv_bounds, patch_processor
 
 # =========================== CONFIGURATION ===========================
 
-test_num = 51011008
+test_num = 51011009
 
 # --- Barometer processing params ---
-WARMUP_DURATION            = 1.0
-ENABLE_STEP_LEVELING       = True
+WARMUP_DURATION            = 2.0
+ENABLE_STEP_LEVELING       = False
 STEP_THRESHOLD_HPA         = 5.0
 STEP_WINDOW_SIZE           = 200
 
-ENABLE_OUTLIER_REMOVAL     = True
+ENABLE_OUTLIER_REMOVAL     = False
 OUTLIER_THRESHOLD_MULTIPLIER = 30.0
 
 DRIFT_REMOVAL_METHOD       = "ema"
