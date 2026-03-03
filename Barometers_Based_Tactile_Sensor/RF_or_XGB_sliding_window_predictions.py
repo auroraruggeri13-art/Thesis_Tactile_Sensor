@@ -40,7 +40,7 @@ from sklearn.ensemble import RandomForestRegressor
 # ============================================================
 
 DATA_DIRECTORY = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\train_validation_test_data"
-sensor_version = 5.01
+sensor_version = 5.20
 TRAIN_FILENAME = f"train_data_v{sensor_version}.csv"
 VALIDATION_FILENAME = f"validation_data_v{sensor_version}.csv"
 TEST_FILENAME  = f"test_data_v{sensor_version}.csv"
@@ -88,7 +88,7 @@ NUM_LEAVES_CONFIGS = [10, 100, 150, 200, 250, 300]  # Values to test
 NUM_LEAVES_POSITION = 200  # num_leaves for x, y
 NUM_LEAVES_FORCE = 200  # num_leaves for fx, fy, fz
 
-# No-contact sentinel conversion: Convert sentinel values to NaN for training
+# No-contact sentinel conversion: Convert sentinel values to NaN for training1
 CONVERT_SENTINEL_TO_NAN = True  # Set to True to enable
 NO_CONTACT_SENTINEL = -999.0  # Sentinel value used in data_organization script
 
@@ -556,10 +556,10 @@ def main():
                             eval_set=[(X_val_ws, y_val_ws[:, i])],
                             eval_names=['valid'])
                     lgbm_models_ws.append(lgbm)
-                    lgbm_preds_ws.append(lgbm.predict(X_test_ws))
-                
+                    lgbm_preds_ws.append(lgbm.predict(X_val_ws))
+
                 y_pred_ws = np.column_stack(lgbm_preds_ws)
-                
+
             elif USE_XGBOOST and HAVE_XGBOOST:
                 xgb_models_ws = []
                 xgb_preds_ws = []
@@ -580,8 +580,8 @@ def main():
                            eval_set=[(X_val_ws, y_val_ws[:, i])],
                            verbose=False)
                     xgb_models_ws.append(xgb)
-                    xgb_preds_ws.append(xgb.predict(X_test_ws))
-                
+                    xgb_preds_ws.append(xgb.predict(X_val_ws))
+
                 y_pred_ws = np.column_stack(xgb_preds_ws)
                 
             elif USE_RANDOM_FOREST:
@@ -600,14 +600,14 @@ def main():
                     )
                     rf.fit(X_train_ws, y_train_ws[:, i])
                     rf_models_ws.append(rf)
-                    rf_preds_ws.append(rf.predict(X_test_ws))
-                
+                    rf_preds_ws.append(rf.predict(X_val_ws))
+
                 y_pred_ws = np.column_stack(rf_preds_ws)
             else:
                 raise ValueError("No model enabled for window size study. Enable at least one model.")
             
-            # Evaluate and store results
-            metrics = calculate_grouped_rmse(y_test_ws, y_pred_ws, TARGET_COLS, 
+            # Evaluate on val set for hyperparameter selection (test set untouched)
+            metrics = calculate_grouped_rmse(y_val_ws, y_pred_ws, TARGET_COLS,
                                             title_suffix=f"Window Size = {ws}",
                                             return_metrics=True)
             window_size_results[ws] = metrics
@@ -647,7 +647,68 @@ def main():
         print(f"Best window size for contact position: {best_ws_contact}")
         print(f"Best window size for force: {best_ws_force}")
         print("="*70)
-        
+
+        # --- Final held-out test set evaluation with best window size (contact) ---
+        print("\n" + "="*70)
+        print(f"FINAL TEST SET EVALUATION (window size = {best_ws_contact})")
+        print("="*70)
+        X_train_best_ws, y_train_best_ws, _, _ = build_window_features(
+            train_df, BARO_COLS, TIME_COL, TARGET_COLS, best_ws_contact,
+            use_second_derivative=USE_SECOND_DERIVATIVE
+        )
+        X_val_best_ws, y_val_best_ws, _, _ = build_window_features(
+            val_df, BARO_COLS, TIME_COL, TARGET_COLS, best_ws_contact,
+            use_second_derivative=USE_SECOND_DERIVATIVE
+        )
+        X_test_best_ws, y_test_best_ws, _, _ = build_window_features(
+            test_df, BARO_COLS, TIME_COL, TARGET_COLS, best_ws_contact,
+            use_second_derivative=USE_SECOND_DERIVATIVE
+        )
+        scaler_best_ws = StandardScaler()
+        X_train_best_ws = scaler_best_ws.fit_transform(X_train_best_ws)
+        X_val_best_ws   = scaler_best_ws.transform(X_val_best_ws)
+        X_test_best_ws  = scaler_best_ws.transform(X_test_best_ws)
+
+        if USE_LIGHTGBM and HAVE_LIGHTGBM:
+            final_preds_ws = []
+            for i, target in enumerate(TARGET_COLS):
+                lgbm_final_ws = LGBMRegressor(
+                    n_estimators=300, learning_rate=0.1, num_leaves=31,
+                    subsample=0.8, colsample_bytree=0.8,
+                    random_state=RANDOM_STATE, n_jobs=-1, verbose=-1, metric='mse',
+                )
+                lgbm_final_ws.fit(X_train_best_ws, y_train_best_ws[:, i],
+                                  eval_set=[(X_val_best_ws, y_val_best_ws[:, i])],
+                                  eval_names=['valid'])
+                final_preds_ws.append(lgbm_final_ws.predict(X_test_best_ws))
+            y_pred_test_best_ws = np.column_stack(final_preds_ws)
+        elif USE_XGBOOST and HAVE_XGBOOST:
+            final_preds_ws = []
+            for i, target in enumerate(TARGET_COLS):
+                xgb_final_ws = XGBRegressor(
+                    n_estimators=300, learning_rate=0.1, max_depth=6,
+                    subsample=0.8, colsample_bytree=0.8,
+                    random_state=RANDOM_STATE, n_jobs=-1, verbosity=0, eval_metric='rmse',
+                )
+                xgb_final_ws.fit(X_train_best_ws, y_train_best_ws[:, i],
+                                 eval_set=[(X_val_best_ws, y_val_best_ws[:, i])], verbose=False)
+                final_preds_ws.append(xgb_final_ws.predict(X_test_best_ws))
+            y_pred_test_best_ws = np.column_stack(final_preds_ws)
+        elif USE_RANDOM_FOREST:
+            final_preds_ws = []
+            for i, target in enumerate(TARGET_COLS):
+                rf_final_ws = RandomForestRegressor(
+                    n_estimators=100, max_depth=20, min_samples_split=5,
+                    min_samples_leaf=2, random_state=RANDOM_STATE, n_jobs=-1, verbose=0,
+                )
+                rf_final_ws.fit(X_train_best_ws, y_train_best_ws[:, i])
+                final_preds_ws.append(rf_final_ws.predict(X_test_best_ws))
+            y_pred_test_best_ws = np.column_stack(final_preds_ws)
+
+        calculate_grouped_rmse(y_test_best_ws, y_pred_test_best_ws, TARGET_COLS,
+                               title_suffix=f"TEST SET - Window Size = {best_ws_contact}",
+                               return_metrics=False)
+
         print("\nWindow size study complete. Exiting.")
         return
     
@@ -708,14 +769,14 @@ def main():
                     lgbm.fit(X_train_lr, y_train_lr[:, target_idx],
                             eval_set=[(X_val_lr, y_val_lr[:, target_idx])],
                             eval_names=['valid'])
-                    position_preds.append(lgbm.predict(X_test_lr))
-                
+                    position_preds.append(lgbm.predict(X_val_lr))
+
                 y_pred_position = np.column_stack(position_preds)
-                y_test_position = y_test_lr[:, [TARGET_COLS.index('x'), TARGET_COLS.index('y')]]
-                
-                # Calculate position metrics
+                y_val_position = y_val_lr[:, [TARGET_COLS.index('x'), TARGET_COLS.index('y')]]
+
+                # Calculate position metrics on val set for hyperparameter selection
                 metrics_pos = calculate_grouped_rmse(
-                    y_test_position, y_pred_position, ['x', 'y'],
+                    y_val_position, y_pred_position, ['x', 'y'],
                     title_suffix=f"Position - LR={lr}, N={n_est}",
                     return_metrics=True
                 )
@@ -739,14 +800,14 @@ def main():
                     lgbm.fit(X_train_lr, y_train_lr[:, target_idx],
                             eval_set=[(X_val_lr, y_val_lr[:, target_idx])],
                             eval_names=['valid'])
-                    force_preds.append(lgbm.predict(X_test_lr))
-                
+                    force_preds.append(lgbm.predict(X_val_lr))
+
                 y_pred_force = np.column_stack(force_preds)
-                y_test_force = y_test_lr[:, [TARGET_COLS.index('fx'), TARGET_COLS.index('fy'), TARGET_COLS.index('fz')]]
-                
-                # Calculate force metrics
+                y_val_force = y_val_lr[:, [TARGET_COLS.index('fx'), TARGET_COLS.index('fy'), TARGET_COLS.index('fz')]]
+
+                # Calculate force metrics on val set for hyperparameter selection
                 metrics_force = calculate_grouped_rmse(
-                    y_test_force, y_pred_force, ['fx', 'fy', 'fz'],
+                    y_val_force, y_pred_force, ['fx', 'fy', 'fz'],
                     title_suffix=f"Force - LR={lr}, N={n_est}",
                     return_metrics=True
                 )
@@ -796,7 +857,54 @@ def main():
         print(f"Best config for force: LR={LEARNING_RATE_CONFIGS[best_config_force]['learning_rate']}, "
               f"N={LEARNING_RATE_CONFIGS[best_config_force]['n_estimators']}")
         print("="*70)
-        
+
+        # --- Final held-out test set evaluation with best configs ---
+        print("\n" + "="*70)
+        print("FINAL TEST SET EVALUATION (best LR configs)")
+        print("="*70)
+        best_lr_pos   = LEARNING_RATE_CONFIGS[best_config_contact]['learning_rate']
+        best_nest_pos = LEARNING_RATE_CONFIGS[best_config_contact]['n_estimators']
+        best_lr_frc   = LEARNING_RATE_CONFIGS[best_config_force]['learning_rate']
+        best_nest_frc = LEARNING_RATE_CONFIGS[best_config_force]['n_estimators']
+
+        print(f"Re-training position models with LR={best_lr_pos}, N={best_nest_pos}")
+        final_pos_preds_lr = []
+        for i, target in enumerate(['x', 'y']):
+            target_idx = TARGET_COLS.index(target)
+            lgbm_final_lr = LGBMRegressor(
+                n_estimators=best_nest_pos, learning_rate=best_lr_pos, num_leaves=31,
+                subsample=0.8, colsample_bytree=0.8,
+                random_state=RANDOM_STATE, n_jobs=-1, verbose=-1, metric='mse',
+            )
+            lgbm_final_lr.fit(X_train_lr, y_train_lr[:, target_idx],
+                              eval_set=[(X_val_lr, y_val_lr[:, target_idx])],
+                              eval_names=['valid'])
+            final_pos_preds_lr.append(lgbm_final_lr.predict(X_test_lr))
+        y_pred_test_pos_lr = np.column_stack(final_pos_preds_lr)
+        y_test_pos_lr = y_test_lr[:, [TARGET_COLS.index('x'), TARGET_COLS.index('y')]]
+        calculate_grouped_rmse(y_test_pos_lr, y_pred_test_pos_lr, ['x', 'y'],
+                               title_suffix=f"TEST SET Position - LR={best_lr_pos}, N={best_nest_pos}",
+                               return_metrics=False)
+
+        print(f"Re-training force models with LR={best_lr_frc}, N={best_nest_frc}")
+        final_frc_preds_lr = []
+        for i, target in enumerate(['fx', 'fy', 'fz']):
+            target_idx = TARGET_COLS.index(target)
+            lgbm_final_lr = LGBMRegressor(
+                n_estimators=best_nest_frc, learning_rate=best_lr_frc, num_leaves=31,
+                subsample=0.8, colsample_bytree=0.8,
+                random_state=RANDOM_STATE, n_jobs=-1, verbose=-1, metric='mse',
+            )
+            lgbm_final_lr.fit(X_train_lr, y_train_lr[:, target_idx],
+                              eval_set=[(X_val_lr, y_val_lr[:, target_idx])],
+                              eval_names=['valid'])
+            final_frc_preds_lr.append(lgbm_final_lr.predict(X_test_lr))
+        y_pred_test_frc_lr = np.column_stack(final_frc_preds_lr)
+        y_test_frc_lr = y_test_lr[:, [TARGET_COLS.index('fx'), TARGET_COLS.index('fy'), TARGET_COLS.index('fz')]]
+        calculate_grouped_rmse(y_test_frc_lr, y_pred_test_frc_lr, ['fx', 'fy', 'fz'],
+                               title_suffix=f"TEST SET Force - LR={best_lr_frc}, N={best_nest_frc}",
+                               return_metrics=False)
+
         print("\nLearning rate study complete. Exiting.")
         return
     
@@ -858,14 +966,14 @@ def main():
                     lgbm.fit(X_train_nl, y_train_nl[:, target_idx],
                             eval_set=[(X_val_nl, y_val_nl[:, target_idx])],
                             eval_names=['valid'])
-                    position_preds.append(lgbm.predict(X_test_nl))
-                
+                    position_preds.append(lgbm.predict(X_val_nl))
+
                 y_pred_position = np.column_stack(position_preds)
-                y_test_position = y_test_nl[:, [TARGET_COLS.index('x'), TARGET_COLS.index('y')]]
-                
-                # Calculate position metrics
+                y_val_position = y_val_nl[:, [TARGET_COLS.index('x'), TARGET_COLS.index('y')]]
+
+                # Calculate position metrics on val set for hyperparameter selection
                 metrics_pos = calculate_grouped_rmse(
-                    y_test_position, y_pred_position, ['x', 'y'],
+                    y_val_position, y_pred_position, ['x', 'y'],
                     title_suffix=f"Position - num_leaves={num_leaves_val}",
                     return_metrics=True
                 )
@@ -889,14 +997,14 @@ def main():
                     lgbm.fit(X_train_nl, y_train_nl[:, target_idx],
                             eval_set=[(X_val_nl, y_val_nl[:, target_idx])],
                             eval_names=['valid'])
-                    force_preds.append(lgbm.predict(X_test_nl))
-                
+                    force_preds.append(lgbm.predict(X_val_nl))
+
                 y_pred_force = np.column_stack(force_preds)
-                y_test_force = y_test_nl[:, [TARGET_COLS.index('fx'), TARGET_COLS.index('fy'), TARGET_COLS.index('fz')]]
-                
-                # Calculate force metrics
+                y_val_force = y_val_nl[:, [TARGET_COLS.index('fx'), TARGET_COLS.index('fy'), TARGET_COLS.index('fz')]]
+
+                # Calculate force metrics on val set for hyperparameter selection
                 metrics_force = calculate_grouped_rmse(
-                    y_test_force, y_pred_force, ['fx', 'fy', 'fz'],
+                    y_val_force, y_pred_force, ['fx', 'fy', 'fz'],
                     title_suffix=f"Force - num_leaves={num_leaves_val}",
                     return_metrics=True
                 )
@@ -942,7 +1050,54 @@ def main():
         print(f"Best num_leaves for contact position: {best_nl_contact}")
         print(f"Best num_leaves for force: {best_nl_force}")
         print("="*70)
-        
+
+        # --- Final held-out test set evaluation with best num_leaves configs ---
+        print("\n" + "="*70)
+        print("FINAL TEST SET EVALUATION (best num_leaves configs)")
+        print("="*70)
+
+        print(f"Re-training position models with num_leaves={best_nl_contact}, "
+              f"LR={LR_POSITION}, N={N_EST_POSITION}")
+        final_pos_preds_nl = []
+        for i, target in enumerate(['x', 'y']):
+            target_idx = TARGET_COLS.index(target)
+            lgbm_final_nl = LGBMRegressor(
+                n_estimators=N_EST_POSITION, learning_rate=LR_POSITION,
+                num_leaves=best_nl_contact,
+                subsample=0.8, colsample_bytree=0.8,
+                random_state=RANDOM_STATE, n_jobs=-1, verbose=-1, metric='mse',
+            )
+            lgbm_final_nl.fit(X_train_nl, y_train_nl[:, target_idx],
+                              eval_set=[(X_val_nl, y_val_nl[:, target_idx])],
+                              eval_names=['valid'])
+            final_pos_preds_nl.append(lgbm_final_nl.predict(X_test_nl))
+        y_pred_test_pos_nl = np.column_stack(final_pos_preds_nl)
+        y_test_pos_nl = y_test_nl[:, [TARGET_COLS.index('x'), TARGET_COLS.index('y')]]
+        calculate_grouped_rmse(y_test_pos_nl, y_pred_test_pos_nl, ['x', 'y'],
+                               title_suffix=f"TEST SET Position - num_leaves={best_nl_contact}",
+                               return_metrics=False)
+
+        print(f"Re-training force models with num_leaves={best_nl_force}, "
+              f"LR={LR_FORCE}, N={N_EST_FORCE}")
+        final_frc_preds_nl = []
+        for i, target in enumerate(['fx', 'fy', 'fz']):
+            target_idx = TARGET_COLS.index(target)
+            lgbm_final_nl = LGBMRegressor(
+                n_estimators=N_EST_FORCE, learning_rate=LR_FORCE,
+                num_leaves=best_nl_force,
+                subsample=0.8, colsample_bytree=0.8,
+                random_state=RANDOM_STATE, n_jobs=-1, verbose=-1, metric='mse',
+            )
+            lgbm_final_nl.fit(X_train_nl, y_train_nl[:, target_idx],
+                              eval_set=[(X_val_nl, y_val_nl[:, target_idx])],
+                              eval_names=['valid'])
+            final_frc_preds_nl.append(lgbm_final_nl.predict(X_test_nl))
+        y_pred_test_frc_nl = np.column_stack(final_frc_preds_nl)
+        y_test_frc_nl = y_test_nl[:, [TARGET_COLS.index('fx'), TARGET_COLS.index('fy'), TARGET_COLS.index('fz')]]
+        calculate_grouped_rmse(y_test_frc_nl, y_pred_test_frc_nl, ['fx', 'fy', 'fz'],
+                               title_suffix=f"TEST SET Force - num_leaves={best_nl_force}",
+                               return_metrics=False)
+
         print("\nnum_leaves study complete. Exiting.")
         return
     
@@ -1029,7 +1184,8 @@ def main():
             xgb.fit(
                 X_train, y_train[:, i],
                 eval_set=[(X_train, y_train[:, i]), (X_val, y_val[:, i])],
-                verbose=False
+                verbose=False,
+                early_stopping_rounds=30,
             )
 
             xgb_models.append(xgb)
@@ -1088,6 +1244,10 @@ def main():
                 X_train, y_train[:, i],
                 eval_set=[(X_train, y_train[:, i]), (X_val, y_val[:, i])],
                 eval_names=['train', 'valid'],
+                callbacks=[
+                    lgb.early_stopping(stopping_rounds=30, verbose=False),
+                    lgb.log_evaluation(period=-1),
+                ],
             )
 
             lgbm_models.append(lgbm)

@@ -1,20 +1,39 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Indenter tip path on the box top — simplified.
+Indenter tip path on the box top surface.
 
-Outputs (same as before):
-- tip_path_top_frame_trial{test}.csv
-- tip_path_top_xy_raw_trial{test}.png
-- tip_path_top_3d_raw_trial{test}.png
-- tip_path_forces_trial{test}.png
-- coordinate_systems_trial{test}.png
-- ati_wrenches_ati_frame_trial{test}.png
-- ati_wrenches_top_frame_trial{test}.png
-- processing_test_{test}.csv
+Frame glossary
+--------------
+  C  : Camera frame      — Atracsys world frame (fixed)
+  B  : Box frame         — tag1, rigidly fixed on the box
+  T  : Top frame         — box surface; origin = B origin + d_T_in_B, axes parallel to B
+  P  : Probe frame       — tag2, moving with the tool
+  A  : ATI frame         — force/torque sensor, fixed offset+rotation relative to P
+
+Pipeline
+--------
+  1. Load Atracsys (tag poses) and ATI (wrench) data.
+  2. Extract R_C_P, R_C_B (orientations in C) and pP_C, pB_C (positions in C).
+  3. Build Top frame T from Box frame B.
+  4. Compute tip position in Top frame: tip_T = R_C_T^T (tip_C - top_origin_C).
+  5. Build ATI frame A from Probe frame P using R_P_A.
+  6. Transform ATI wrench → Top frame → transfer moment to tip contact point.
+  7. Save CSV and plots.
+
+Outputs
+-------
+  tip_path_top_frame_trial{N}.csv
+  tip_path_top_xy_raw_trial{N}.png
+  tip_path_top_3d_raw_trial{N}.png
+  tip_path_forces_trial{N}.png
+  coordinate_systems_trial{N}.png
+  ati_wrenches_ati_frame_trial{N}.png
+  ati_wrenches_top_frame_trial{N}.png
+  processing_test_{N}.csv
 """
 
-import os, re, sys, argparse
+import os, sys, argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -22,625 +41,584 @@ from pathlib import Path
 from matplotlib.patches import Rectangle
 from scipy import signal
 
-# Make utils importable when running from any working directory
 sys.path.insert(0, str(Path(__file__).parent))
-
 from utils.sensor_io import load_ati_data, load_atracsys_data, asof_join
 
-# =========================
-# Inputs / settings (edit here)
-# =========================
-TEST_NUM = 51092
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1 — TRIAL / PATH SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_NUM    = 52001
 VERSION_NUM = 5
-BOX_TAG_ID = 1
+BOX_TAG_ID  = 1          # marker_id of the fixed box AprilTag (tag1)
 
 DATASET_DIR = os.path.abspath(
-    fr"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data\test {TEST_NUM} - sensor v{VERSION_NUM}"
+    fr"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data"
+    fr"\test {TEST_NUM} - sensor v{VERSION_NUM}"
 )
-
 ATRACSYS_FILE = f"atracsys_trial{TEST_NUM}.txt"
-ATI_FILE      = f"{TEST_NUM}ati_middle_trial.txt"  # assumes this pattern exists
+ATI_FILE      = f"{TEST_NUM}ati_middle_trial.txt"
 
-PAIR_TOL_S = 0.020
-Z_LIMIT_MM_2D = 10.0
+PAIR_TOL_S    = 0.020    # max time gap [s] for sensor synchronisation
+Z_LIMIT_MM_2D = 10.0     # Z-depth filter for 2-D surface plots [mm]
 
-# Top origin offset in Box axes (meters)
-Z_SHIFT = 92 / 1000
-X_SHIFT = -19 / 1000 
-Y_SHIFT = 76 / 1000
 
-# Box->Top rotation (matrix)
-R_B_T = np.array([
-    [1.0, 0.0, 0.0],
-    [0.0, 1.0, 0.0],
-    [0.0, 0.0, 1.0],
-], dtype=float).T
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2 — COORDINATE FRAME DEFINITIONS
+#
+#   All geometric relationships between frames are defined here.
+#   Edit these when the physical setup changes.
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# Tip offset in PROBE frame (meters)
-TIP_OFFSET_IN_PROBE_M = np.array([0.0, 0.01, -0.065], dtype=float) #-0.060
+# ── Box (B) → Top (T) ─────────────────────────────────────────────────────────
+# The Top frame origin is offset from the Box tag origin by d_T_in_B,
+# expressed in Box frame axes.  Orientation is parallel (R_B_T = I).
 
-# ATI and TIP frame rotation: 180° around Z axis relative to PROBE frame
-R_P_A = np.eye(3)
-# R_180_Z = np.array([
-#     [-1.0, 0.0, 0.0],
-#     [0.0, -1.0, 0.0],
-#     [0.0, 0.0, 1.0]
-# ], dtype=float)
-# R_P_A = R_180_Z
-# R_P_TIP = R_180_Z  # Tip frame also rotated 180° around Z
+X_SHIFT = 15 / 1000    # m — Top origin along Box X
+Y_SHIFT = 64 / 1000    # m — Top origin along Box Y
+Z_SHIFT = 115 / 1000    # m — Top origin along Box Z  (height of box surface)
+
+CORRECT_INPLANE_ROTATION  = True
+MANUAL_ROTATION_ANGLE_DEG = 6         # degrees; None → auto (PCA)
+
+R_B_T = np.eye(3, dtype=float)   # Top axes aligned with Box axes
+
+# ── Probe (P) → Tip ───────────────────────────────────────────────────────────
+# Fixed vector from probe AprilTag origin to the physical indenter tip,
+# expressed in Probe frame coordinates [m].
+
+TIP_OFFSET_IN_PROBE_M = np.array([0.0, 0.01, -0.055], dtype=float)
+
+# ── Probe (P) → ATI (A) ───────────────────────────────────────────────────────
+# The ATI sensor is rigidly mounted on the probe shaft.
+# Physical layout (probe frame: X=left, Y=down, Z=out-of-page):
+#   • ATI Y axis points upper-left  (138° from drawing-right = 42° above probe X)
+#   • ATI X axis points lower-left  (228° from drawing-right = 42° below probe X)
+#   • ATI Z axis points INTO page   (inverted relative to probe Z)
+#
+# Decomposition: R_P_A = Rz(48°) @ Rx(180°)
+#   Rz(48°)  : 48° CCW in-plane rotation
+#   Rx(180°) : flips ATI Y and Z in the rotated frame (puts Z into page)
+#
+# R_P_A : maps a vector expressed in ATI frame into Probe frame coordinates.
+#         Column i = i-th ATI axis expressed in Probe coordinates.
+
+_angle_PA = np.deg2rad(48.0)
+_Rz48 = np.array([
+    [ np.cos(_angle_PA), -np.sin(_angle_PA), 0.0],
+    [ np.sin(_angle_PA),  np.cos(_angle_PA), 0.0],
+    [ 0.0,                0.0,               1.0],
+], dtype=float)
+_Rx180 = np.array([
+    [1.0,  0.0,  0.0],
+    [0.0, -1.0,  0.0],
+    [0.0,  0.0, -1.0],
+], dtype=float)
+R_P_A = _Rz48 @ _Rx180   # ATI Y→upper-left (138°), ATI X→lower-left (228°), ATI Z→into page
+
+# ── ATI sensing point ─────────────────────────────────────────────────────────
+# The ATI force-sensing origin is located above the tip along the probe shaft.
+# Used in the moment-transfer step: M_tip = M_ATI + r_{tip→ATI} × F.
+
 AXIAL_DIR_IN_PROBE = np.array([0.0, 0.0, 1.0], dtype=float)
-ATI_ABOVE_TIP_M = 0.025
+ATI_ABOVE_TIP_M    = 0.015    # m — distance from tip to ATI sensing origin
 
-# Smoothing (good options)
-# - "butter": strong, smooth, no phase shift (filtfilt)
-# - "savgol": preserves corners/shape better for trajectories
-# - "none"
-SMOOTH_METHOD = "savgol"     # "butter" | "savgol" | "none"
-BUTTER_CUTOFF_HZ = 8.0
-BUTTER_ORDER = 4
-SAVGOL_WINDOW_S = 9 / 60       # ~0.1 to 0.25 s typical
-SAVGOL_POLYORDER = 0
 
-# In plane rotation correction
-CORRECT_INPLANE_ROTATION = True
-MANUAL_ROTATION_ANGLE_DEG = 0 # None = auto (PCA)
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3 — SIGNAL PROCESSING SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# =========================
-# Loading
-# =========================
-def split_probe_and_box_fixed(df: pd.DataFrame, box_id: int = BOX_TAG_ID):
+SMOOTH_METHOD             = "savgol"   # "butter" | "savgol" | "none"
+BUTTER_CUTOFF_HZ          = 8.0
+BUTTER_ORDER              = 4
+SAVGOL_WINDOW_S           = 9 / 60    # window duration [s]
+SAVGOL_POLYORDER          = 0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4 — DATA LOADING HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def split_probe_and_box(df: pd.DataFrame, box_id: int = BOX_TAG_ID):
+    """Return (probe_df, box_df, probe_marker_id).
+
+    Box tag is identified by marker_id == box_id.
+    Probe tag is whichever remaining tag has the highest positional variance
+    (i.e. moves the most).
+    """
     box = df[df["marker_id"] == box_id].sort_values("t").reset_index(drop=True)
     if box.empty:
-        raise ValueError(f"Box tag {box_id} not found")
+        raise ValueError(f"Box tag {box_id} not found in data")
 
     others = df[df["marker_id"] != box_id]
     if others.empty:
-        raise ValueError("No probe tag found")
+        raise ValueError("No probe tag found in data")
 
-    # probe = tag with largest motion
-    stats = []
-    for k in others["marker_id"].unique():
-        p = others[others["marker_id"] == k][["px","py","pz"]].to_numpy()
-        stats.append((k, float(np.var(p, axis=0).sum())))
+    stats = [
+        (k, float(np.var(others[others["marker_id"] == k][["px","py","pz"]].to_numpy(), axis=0).sum()))
+        for k in others["marker_id"].unique()
+    ]
     probe_id = max(stats, key=lambda x: x[1])[0]
-
     probe = df[df["marker_id"] == probe_id].sort_values("t").reset_index(drop=True)
     return probe, box, probe_id
 
-# =========================
-# Math helpers
-# =========================
-def smooth_xyz(xyz: np.ndarray, t: np.ndarray) -> np.ndarray:
-    if SMOOTH_METHOD == "none":
-        return xyz
-
-    dt = np.median(np.diff(t))
-    fs = 1.0 / dt
-
-    if SMOOTH_METHOD == "butter":
-        nyq = 0.5 * fs
-        wn = BUTTER_CUTOFF_HZ / nyq
-        b, a = signal.butter(BUTTER_ORDER, wn, btype="low")
-        out = np.zeros_like(xyz)
-        for i in range(3):
-            out[:, i] = signal.filtfilt(b, a, xyz[:, i])
-        return out
-
-    if SMOOTH_METHOD == "savgol":
-        win = int(round(SAVGOL_WINDOW_S * fs))
-        win = max(win, SAVGOL_POLYORDER + 2)
-        if win % 2 == 0:
-            win += 1
-        out = np.zeros_like(xyz)
-        for i in range(3):
-            out[:, i] = signal.savgol_filter(xyz[:, i], window_length=win, polyorder=SAVGOL_POLYORDER)
-        return out
-
-    raise ValueError(f"Unknown SMOOTH_METHOD: {SMOOTH_METHOD}")
-
-def estimate_inplane_rotation(x: np.ndarray, y: np.ndarray) -> float:
-    valid = np.isfinite(x) & np.isfinite(y)
-    x = x[valid]; y = y[valid]
-    x = x - np.mean(x); y = y - np.mean(y)
-    cov = np.cov(x, y)
-    w, v = np.linalg.eig(cov)
-    axis = v[:, np.argmax(w)]
-    return float(np.arctan2(axis[1], axis[0]))
-
-def apply_inplane_rotation(x: np.ndarray, y: np.ndarray, angle_rad: float):
-    ca = np.cos(-angle_rad)
-    sa = np.sin(-angle_rad)
-    xr = ca * x - sa * y
-    yr = sa * x + ca * y
-    return xr, yr
-
-def wrench_A_to_T(R_TA: np.ndarray, p_A_in_T: np.ndarray, F_A: np.ndarray, M_A: np.ndarray):
-    F_T = np.einsum("nij,nj->ni", R_TA, F_A)
-    M_rot = np.einsum("nij,nj->ni", R_TA, M_A)
-    M_T = M_rot + np.cross(p_A_in_T, F_T)
-    return F_T, M_T
 
 def stabilize_box_orientation(R_C_B: np.ndarray) -> np.ndarray:
+    """Replace per-frame box orientations with a single averaged orientation.
+
+    Fixes AprilTag tracking discontinuities on a nominally static object by
+    averaging all quaternions and broadcasting the result to every frame.
     """
-    Stabilize box orientation by fixing orientation discontinuities.
-    Uses the first orientation as reference and ensures all subsequent
-    orientations are in the same hemisphere (dot product > 0).
-    """
-    N = len(R_C_B)
-    R_stable = R_C_B.copy()
-    
-    # Use median orientation as reference (more robust than first frame)
-    # Convert to quaternions for easier comparison
     def rotm_to_quat(R):
-        """Convert rotation matrix to quaternion (w, x, y, z)"""
         trace = np.trace(R)
         if trace > 0:
             s = 0.5 / np.sqrt(trace + 1.0)
-            w = 0.25 / s
-            x = (R[2,1] - R[1,2]) * s
-            y = (R[0,2] - R[2,0]) * s
-            z = (R[1,0] - R[0,1]) * s
-        else:
-            if R[0,0] > R[1,1] and R[0,0] > R[2,2]:
-                s = 2.0 * np.sqrt(1.0 + R[0,0] - R[1,1] - R[2,2])
-                w = (R[2,1] - R[1,2]) / s
-                x = 0.25 * s
-                y = (R[0,1] + R[1,0]) / s
-                z = (R[0,2] + R[2,0]) / s
-            elif R[1,1] > R[2,2]:
-                s = 2.0 * np.sqrt(1.0 + R[1,1] - R[0,0] - R[2,2])
-                w = (R[0,2] - R[2,0]) / s
-                x = (R[0,1] + R[1,0]) / s
-                y = 0.25 * s
-                z = (R[1,2] + R[2,1]) / s
-            else:
-                s = 2.0 * np.sqrt(1.0 + R[2,2] - R[0,0] - R[1,1])
-                w = (R[1,0] - R[0,1]) / s
-                x = (R[0,2] + R[2,0]) / s
-                y = (R[1,2] + R[2,1]) / s
-                z = 0.25 * s
-        return np.array([w, x, y, z])
-    
+            return np.array([0.25/s, (R[2,1]-R[1,2])*s, (R[0,2]-R[2,0])*s, (R[1,0]-R[0,1])*s])
+        if R[0,0] > R[1,1] and R[0,0] > R[2,2]:
+            s = 2.0 * np.sqrt(1.0 + R[0,0] - R[1,1] - R[2,2])
+            return np.array([(R[2,1]-R[1,2])/s, 0.25*s, (R[0,1]+R[1,0])/s, (R[0,2]+R[2,0])/s])
+        if R[1,1] > R[2,2]:
+            s = 2.0 * np.sqrt(1.0 + R[1,1] - R[0,0] - R[2,2])
+            return np.array([(R[0,2]-R[2,0])/s, (R[0,1]+R[1,0])/s, 0.25*s, (R[1,2]+R[2,1])/s])
+        s = 2.0 * np.sqrt(1.0 + R[2,2] - R[0,0] - R[1,1])
+        return np.array([(R[1,0]-R[0,1])/s, (R[0,2]+R[2,0])/s, (R[1,2]+R[2,1])/s, 0.25*s])
+
     def quat_to_rotm(q):
-        """Convert quaternion (w, x, y, z) to rotation matrix"""
         w, x, y, z = q
         return np.array([
-            [1-2*(y*y+z*z), 2*(x*y-w*z), 2*(x*z+w*y)],
-            [2*(x*y+w*z), 1-2*(x*x+z*z), 2*(y*z-w*x)],
-            [2*(x*z-w*y), 2*(y*z+w*x), 1-2*(x*x+y*y)]
+            [1-2*(y*y+z*z),   2*(x*y-w*z),   2*(x*z+w*y)],
+            [  2*(x*y+w*z), 1-2*(x*x+z*z),   2*(y*z-w*x)],
+            [  2*(x*z-w*y),   2*(y*z+w*x), 1-2*(x*x+y*y)],
         ])
-    
-    # Convert all to quaternions
+
+    N = len(R_C_B)
     quats = np.array([rotm_to_quat(R_C_B[i]) for i in range(N)])
-    
-    # Use first quaternion as reference
     q_ref = quats[0]
-    
-    # Fix sign flips: if dot product with reference is negative, flip the quaternion
-    for i in range(N):
+    for i in range(N):                          # ensure same hemisphere
         if np.dot(quats[i], q_ref) < 0:
             quats[i] = -quats[i]
-    
-    # Average the quaternions (simple mean, since they're now all in same hemisphere)
-    q_mean = np.mean(quats, axis=0)
-    q_mean = q_mean / np.linalg.norm(q_mean)  # Renormalize
-    
-    # Use this fixed orientation for all frames
+    q_mean = quats.mean(axis=0)
+    q_mean /= np.linalg.norm(q_mean)
     R_fixed = quat_to_rotm(q_mean)
-    
-    for i in range(N):
-        R_stable[i] = R_fixed
-    
-    print(f"Box orientation stabilized: using averaged orientation from all {N} frames")
-    
-    return R_stable
+    print(f"Box orientation stabilised using mean of {N} frames.")
+    return np.broadcast_to(R_fixed, R_C_B.shape).copy()
 
-# =========================
-# Plotting 
-# =========================
-def plot_top_xy(out_dir: str, X: np.ndarray, Y: np.ndarray, Z: np.ndarray, test_num: int):
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5 — SIGNAL PROCESSING HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def smooth_xyz(xyz: np.ndarray, t: np.ndarray) -> np.ndarray:
+    if SMOOTH_METHOD == "none":
+        return xyz
+    fs = 1.0 / np.median(np.diff(t))
+    if SMOOTH_METHOD == "butter":
+        b, a = signal.butter(BUTTER_ORDER, BUTTER_CUTOFF_HZ / (0.5 * fs), btype="low")
+        return np.column_stack([signal.filtfilt(b, a, xyz[:, i]) for i in range(3)])
+    if SMOOTH_METHOD == "savgol":
+        win = max(int(round(SAVGOL_WINDOW_S * fs)), SAVGOL_POLYORDER + 2)
+        if win % 2 == 0:
+            win += 1
+        return np.column_stack([
+            signal.savgol_filter(xyz[:, i], window_length=win, polyorder=SAVGOL_POLYORDER)
+            for i in range(3)
+        ])
+    raise ValueError(f"Unknown SMOOTH_METHOD: {SMOOTH_METHOD!r}")
+
+
+def estimate_inplane_rotation(x: np.ndarray, y: np.ndarray) -> float:
+    """PCA-based in-plane rotation angle of a 2-D trajectory [radians]."""
+    valid = np.isfinite(x) & np.isfinite(y)
+    x = x[valid] - x[valid].mean()
+    y = y[valid] - y[valid].mean()
+    w, v = np.linalg.eig(np.cov(x, y))
+    axis = v[:, np.argmax(w)]
+    return float(np.arctan2(axis[1], axis[0]))
+
+
+def apply_inplane_rotation(x: np.ndarray, y: np.ndarray, angle_rad: float):
+    ca, sa = np.cos(-angle_rad), np.sin(-angle_rad)
+    return ca*x - sa*y, sa*x + ca*y
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6 — WRENCH TRANSFORMATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def transport_wrench(R_new_old: np.ndarray,
+                     p_old_in_new: np.ndarray,
+                     F_old: np.ndarray,
+                     M_old: np.ndarray):
+    """Rigid-body wrench transport.
+
+    Rotates a wrench from frame OLD into frame NEW and transfers the moment
+    reference point from OLD origin to NEW origin.
+
+    Parameters
+    ----------
+    R_new_old   : (N,3,3)  rotation mapping OLD vectors → NEW frame
+    p_old_in_new: (N,3)    position of OLD origin expressed in NEW frame
+    F_old, M_old: (N,3)    force and moment in OLD frame
+
+    Returns
+    -------
+    F_new : (N,3)  force in NEW frame          F_new = R @ F_old
+    M_new : (N,3)  moment at NEW origin         M_new = R @ M_old + p_old_in_new × F_new
+    """
+    F_new = np.einsum("nij,nj->ni", R_new_old, F_old)
+    M_new = np.einsum("nij,nj->ni", R_new_old, M_old) + np.cross(p_old_in_new, F_new)
+    return F_new, M_new
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7 — PLOTTING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def plot_top_xy(out_dir, X, Y, Z, test_num):
     plt.figure(figsize=(8, 6))
     z_mask = np.isfinite(Z) & (np.abs(Z * 1e3) <= Z_LIMIT_MM_2D)
-    x_mm = X * 1e3
-    y_mm = Y * 1e3
-    x_plot = x_mm.copy(); y_plot = y_mm.copy()
-    x_plot[~z_mask] = np.nan; y_plot[~z_mask] = np.nan
-    plt.plot(x_plot, y_plot, linewidth=1.2)
-
-    ax2d = plt.gca()
-    rect_w, rect_h = 40.0, 16.0
-    rect = Rectangle((-rect_w/2.0, -rect_h/2.0), rect_w, rect_h,
-                     fill=False, edgecolor='k', linewidth=1.0, linestyle='--', alpha=0.9)
-    ax2d.add_patch(rect)
-
-    plt.grid(True, alpha=0.3)
-    plt.axis("equal")
+    xp, yp = X * 1e3, Y * 1e3
+    xp[~z_mask] = np.nan; yp[~z_mask] = np.nan
+    plt.plot(xp, yp, linewidth=1.2)
+    ax = plt.gca()
+    ax.add_patch(Rectangle((-20, -8), 40, 16,
+                            fill=False, edgecolor='k', linewidth=1.0, linestyle='--', alpha=0.9))
+    plt.grid(True, alpha=0.3); plt.axis("equal")
     plt.xlim([-25, 25]); plt.ylim([-10, 10])
     plt.xlabel("Top X [mm]"); plt.ylabel("Top Y [mm]")
-    plt.title(f"Tip path on top surface (unflattened) — trial {test_num}")
-    fig_path = os.path.join(out_dir, f"tip_path_top_xy_raw_trial{test_num}.png")
-    plt.savefig(fig_path, dpi=220, bbox_inches="tight")
-    plt.show()
-    print(f"Saved plot: {fig_path}")
+    plt.title(f"Tip path on top surface — trial {test_num}")
+    path = os.path.join(out_dir, f"tip_path_top_xy_raw_trial{test_num}.png")
+    plt.savefig(path, dpi=220, bbox_inches="tight"); plt.show()
+    print(f"Saved: {path}")
 
-def plot_top_3d(out_dir: str, X: np.ndarray, Y: np.ndarray, Z: np.ndarray, test_num: int, z_limit_mm: float):
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection="3d")
 
-    x_mm, y_mm, z_mm = X * 1e3, Y * 1e3, Z * 1e3
-    mask = (x_mm >= -20) & (x_mm <= 20) & (y_mm >= -8) & (y_mm <= 8) & (z_mm >= -z_limit_mm) & (z_mm <= z_limit_mm)
-
+def plot_top_3d(out_dir, X, Y, Z, test_num, z_limit_mm):
+    fig = plt.figure(); ax = fig.add_subplot(111, projection="3d")
+    x_mm, y_mm, z_mm = X*1e3, Y*1e3, Z*1e3
+    mask = (x_mm >= -20) & (x_mm <= 20) & (y_mm >= -8) & (y_mm <= 8) & (np.abs(z_mm) <= z_limit_mm)
     if np.any(mask):
         mp = np.concatenate([[False], mask, [False]])
-        d = np.diff(mp.astype(int))
-        starts = np.where(d == 1)[0]
-        ends   = np.where(d == -1)[0]
-        for s, e in zip(starts, ends):
+        d  = np.diff(mp.astype(int))
+        for s, e in zip(np.where(d == 1)[0], np.where(d == -1)[0]):
             ax.plot(x_mm[s:e], y_mm[s:e], z_mm[s:e], linewidth=1.0, color='C0')
-        title_extra = " (filtered to ±20×±8×±2 mm)"
+        extra = " (filtered ±20×±8×±z_limit mm)"
     else:
         ax.plot(x_mm, y_mm, z_mm, linewidth=1.0)
-        title_extra = " (no points in filtered window — showing all)"
-
-    ax.set_xlabel("Top X [mm]")
-    ax.set_ylabel("Top Y [mm]")
-    ax.set_zlabel("Top Z [mm]")
-    ax.set_title(f"Tip path in Top frame (unflattened){title_extra} — trial {test_num}")
+        extra = " (no filtered points — showing all)"
+    ax.set_xlabel("Top X [mm]"); ax.set_ylabel("Top Y [mm]"); ax.set_zlabel("Top Z [mm]")
+    ax.set_title(f"Tip path in Top frame{extra} — trial {test_num}")
     ax.set_box_aspect([1, 1, 0.3])
+    path = os.path.join(out_dir, f"tip_path_top_3d_raw_trial{test_num}.png")
+    plt.savefig(path, dpi=220, bbox_inches="tight"); plt.show()
+    print(f"Saved: {path}")
 
-    fig_path = os.path.join(out_dir, f"tip_path_top_3d_raw_trial{test_num}.png")
-    plt.savefig(fig_path, dpi=220, bbox_inches="tight")
-    plt.show()
-    print(f"Saved plot: {fig_path}")
 
-def plot_top_path_with_forces(out_dir: str, X: np.ndarray, Y: np.ndarray, Z: np.ndarray,
-                             times: np.ndarray, ati_df: pd.DataFrame, test_num: int):
-    tip_df = pd.DataFrame({
-        'time': times,
-        'x_mm': X * 1e3,
-        'y_mm': Y * 1e3,
-        'z_mm': Z * 1e3,
-    }).sort_values('time').reset_index(drop=True)
-
+def plot_top_path_with_forces(out_dir, X, Y, Z, times, ati_df, test_num):
+    tip_df = pd.DataFrame({"time": times, "x_mm": X*1e3, "y_mm": Y*1e3, "z_mm": Z*1e3}
+                          ).sort_values("time").reset_index(drop=True)
     merged = pd.merge_asof(
-        tip_df, ati_df.sort_values('time').reset_index(drop=True),
-        on='time', direction='nearest', tolerance=PAIR_TOL_S
-    ).dropna(subset=['Fx', 'Fy', 'Fz']).reset_index(drop=True)
+        tip_df, ati_df.sort_values("time").reset_index(drop=True),
+        on="time", direction="nearest", tolerance=PAIR_TOL_S,
+    ).dropna(subset=["Fx","Fy","Fz"]).reset_index(drop=True)
 
-    rng = np.random.default_rng()
-    n_samples = min(3, len(merged))
-    sel = merged.iloc[rng.choice(len(merged), size=n_samples, replace=False)]
+    n_sel  = min(3, len(merged))
+    sel    = merged.iloc[np.random.default_rng().choice(len(merged), size=n_sel, replace=False)]
+    span   = max(tip_df["x_mm"].max()-tip_df["x_mm"].min(),
+                 tip_df["y_mm"].max()-tip_df["y_mm"].min(), 1.0)
+    maxF   = np.linalg.norm(sel[["Fx","Fy","Fz"]].to_numpy(), axis=1).max()
+    scale  = 0.2 * span / (maxF + 1e-9)
 
-    x_min, x_max = np.nanmin(tip_df['x_mm']), np.nanmax(tip_df['x_mm'])
-    y_min, y_max = np.nanmin(tip_df['y_mm']), np.nanmax(tip_df['y_mm'])
-    span = max(x_max - x_min, y_max - y_min, 1.0)
-    forces = np.vstack([sel['Fx'].to_numpy(), sel['Fy'].to_numpy(), sel['Fz'].to_numpy()]).T
-    maxF = np.linalg.norm(forces, axis=1).max()
-    scale_mm_per_N = 0.2 * span / (maxF + 1e-9)
+    fig = plt.figure(figsize=(8, 6)); ax = fig.add_subplot(111, projection="3d")
+    ax.plot(tip_df["x_mm"], tip_df["y_mm"], tip_df["z_mm"],
+            "-", color="tab:blue", linewidth=1.0, alpha=0.8, label="Tip path")
 
-    fig = plt.figure(figsize=(8, 6))
-    ax = fig.add_subplot(111, projection='3d')
-    ax.plot(tip_df['x_mm'], tip_df['y_mm'], tip_df['z_mm'], '-', color='tab:blue', linewidth=1.0, alpha=0.8, label='Tip path')
-
-    added_labels = set()
+    added = set()
     for _, row in sel.iterrows():
-        ox, oy, oz = float(row['x_mm']), float(row['y_mm']), float(row['z_mm'])
-        fx, fy, fz = float(row['Fx']), float(row['Fy']), float(row['Fz'])
-        origin_offsets = [(-0.6, 0.0, 0.0), (0.0, 0.0, 0.0), (0.6, 0.0, 0.0)]
-        comps = [('Fx', fx, (1.0, 0.0, 0.0)), ('Fy', fy, (0.0, 0.6, 0.0)), ('Fz', fz, (0.0, 0.0, 1.0))]
-
+        ox, oy, oz = float(row["x_mm"]), float(row["y_mm"]), float(row["z_mm"])
+        offsets = [(-0.6,0,0), (0,0,0), (0.6,0,0)]
+        comps   = [("Fx", float(row["Fx"]), (1,0,0)),
+                   ("Fy", float(row["Fy"]), (0,.6,0)),
+                   ("Fz", float(row["Fz"]), (0,0,1))]
         for j, (name, val, col) in enumerate(comps):
-            dx = (val * scale_mm_per_N) if name == 'Fx' else 0.0
-            dy = (val * scale_mm_per_N) if name == 'Fy' else 0.0
-            dz = (val * scale_mm_per_N) if name == 'Fz' else 0.0
-            offx, offy, offz = origin_offsets[j]
-            oxo, oyo, ozo = ox + offx, oy + offy, oz + offz
-            label = name if name not in added_labels else None
-            ax.quiver(oxo, oyo, ozo, dx, dy, dz, color=col, linewidth=1.5,
-                      arrow_length_ratio=0.2, normalize=False, label=label)
-            ax.text(oxo + dx, oyo + dy, ozo + dz,
+            dx = val*scale if name == "Fx" else 0.0
+            dy = val*scale if name == "Fy" else 0.0
+            dz = val*scale if name == "Fz" else 0.0
+            offx, offy, offz = offsets[j]
+            lbl = name if name not in added else None
+            ax.quiver(ox+offx, oy+offy, oz+offz, dx, dy, dz,
+                      color=col, linewidth=1.5, arrow_length_ratio=0.2, normalize=False, label=lbl)
+            ax.text(ox+offx+dx, oy+offy+dy, oz+offz+dz,
                     f"{name}={val:.2f}N\nt={row['time']:.3f}s", color=col, fontsize=8)
-            if label is not None:
-                added_labels.add(name)
+            if lbl:
+                added.add(name)
 
-    ax.set_xlabel('Top X [mm]')
-    ax.set_ylabel('Top Y [mm]')
-    ax.set_zlabel('Top Z [mm]')
-    ax.set_title(f'Tip path with force directions (3 random times) — trial {test_num}')
-    ax.legend()
-    outpath = os.path.join(out_dir, f"tip_path_forces_trial{test_num}.png")
-    plt.savefig(outpath, dpi=220, bbox_inches='tight')
-    plt.show()
-    print(f"Saved force-arrow plot: {outpath}")
+    ax.set_xlabel("Top X [mm]"); ax.set_ylabel("Top Y [mm]"); ax.set_zlabel("Top Z [mm]")
+    ax.set_title(f"Tip path with ATI force directions — trial {test_num}"); ax.legend()
+    path = os.path.join(out_dir, f"tip_path_forces_trial{test_num}.png")
+    plt.savefig(path, dpi=220, bbox_inches="tight"); plt.show()
+    print(f"Saved: {path}")
 
-def plot_ati_wrenches(out_dir: str, ati_df: pd.DataFrame, test_num: int, frame_label: str = ""):
-    ati_clean = ati_df.dropna(subset=['Fx','Fy','Fz','Tx','Ty','Tz'])
-    t = ati_clean['time'].to_numpy()
 
-    Fx, Fy, Fz = ati_clean['Fx'].to_numpy(), ati_clean['Fy'].to_numpy(), ati_clean['Fz'].to_numpy()
-    Tx, Ty, Tz = ati_clean['Tx'].to_numpy(), ati_clean['Ty'].to_numpy(), ati_clean['Tz'].to_numpy()
-
+def plot_ati_wrenches(out_dir, ati_df, test_num, frame_label=""):
+    df = ati_df.dropna(subset=["Fx","Fy","Fz","Tx","Ty","Tz"])
+    t  = df["time"].to_numpy()
     fig, axs = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-
-    axs[0].plot(t, Fx, label='Fx', color='r', linewidth=1.5)
-    axs[0].plot(t, Fy, label='Fy', color='g', linewidth=1.5)
-    axs[0].plot(t, Fz, label='Fz', color='b', linewidth=1.5)
-    axs[0].set_ylabel('Force [N]', fontsize=12)
-    title_force = f'ATI Force Time Series — trial {test_num}'
-    if frame_label:
-        title_force += f' ({frame_label})'
-    axs[0].set_title(title_force, fontsize=13, fontweight='bold')
-    axs[0].legend(loc='best', fontsize=10)
-    axs[0].grid(True, alpha=0.3)
-
-    axs[1].plot(t, Tx, label='Tx', color='r', linewidth=1.5)
-    axs[1].plot(t, Ty, label='Ty', color='g', linewidth=1.5)
-    axs[1].plot(t, Tz, label='Tz', color='b', linewidth=1.5)
-    axs[1].set_xlabel('Time [s]', fontsize=12)
-    axs[1].set_ylabel('Torque [Nm]', fontsize=12)
-    title_torque = f'ATI Torque Time Series — trial {test_num}'
-    if frame_label:
-        title_torque += f' ({frame_label})'
-    axs[1].set_title(title_torque, fontsize=13, fontweight='bold')
-    axs[1].legend(loc='best', fontsize=10)
-    axs[1].grid(True, alpha=0.3)
-
+    pairs = [
+        (["Fx","Fy","Fz"], "Force [N]",  "ATI Force Time Series"),
+        (["Tx","Ty","Tz"], "Torque [Nm]","ATI Torque Time Series"),
+    ]
+    for (comps, ylabel, base_title), ax in zip(pairs, axs):
+        for c, col in zip(comps, ["r","g","b"]):
+            ax.plot(t, df[c].to_numpy(), label=c, color=col, linewidth=1.5)
+        title = f"{base_title} — trial {test_num}" + (f" ({frame_label})" if frame_label else "")
+        ax.set_title(title, fontsize=13, fontweight="bold")
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.legend(loc="best", fontsize=10); ax.grid(True, alpha=0.3)
+    axs[1].set_xlabel("Time [s]", fontsize=12)
     plt.tight_layout()
-    suffix = f"_{frame_label.lower().replace(' ', '_')}" if frame_label else ""
-    outpath = os.path.join(out_dir, f"ati_wrenches{suffix}_trial{test_num}.png")
-    plt.savefig(outpath, dpi=220, bbox_inches="tight")
-    plt.close()
-    print(f"Saved ATI wrench plot ({frame_label}): {outpath}")
+    suffix = f"_{frame_label.lower().replace(' ','_')}" if frame_label else ""
+    path = os.path.join(out_dir, f"ati_wrenches{suffix}_trial{test_num}.png")
+    plt.savefig(path, dpi=220, bbox_inches="tight"); plt.close()
+    print(f"Saved: {path}")
 
-def plot_coordinate_systems(out_dir: str,
-                            pP_C: np.ndarray, pB_C: np.ndarray, tip_C: np.ndarray,
-                            R_C_P: np.ndarray, R_C_B: np.ndarray, R_C_T: np.ndarray,
-                            top_origin_C: np.ndarray, ati_origin_C: np.ndarray, R_C_A: np.ndarray,
-                            test_num: int):
+
+def plot_coordinate_systems(out_dir, pP_C, pB_C, tip_C,
+                             R_C_P, R_C_B, R_C_T,
+                             top_origin_C, ati_origin_C, R_C_A,
+                             test_num):
     fig = plt.figure(figsize=(10, 8))
-    ax = fig.add_subplot(111, projection="3d")
+    ax  = fig.add_subplot(111, projection="3d")
 
-    ax.plot(pP_C[:, 0]*1000, pP_C[:, 1]*1000, pP_C[:, 2]*1000, 'b-', label='Probe Path', alpha=0.5)
-    ax.plot(pB_C[:, 0]*1000, pB_C[:, 1]*1000, pB_C[:, 2]*1000, 'r-', label='Box Path', alpha=0.5)
-    ax.plot(tip_C[:, 0]*1000, tip_C[:, 1]*1000, tip_C[:, 2]*1000, 'g-', label='Tip Path', alpha=0.5)
+    ax.plot(*[pP_C[:,i]*1000 for i in range(3)], "b-", label="Probe Path",  alpha=0.5)
+    ax.plot(*[pB_C[:,i]*1000 for i in range(3)], "r-", label="Box Path",    alpha=0.5)
+    ax.plot(*[tip_C[:,i]*1000 for i in range(3)],"g-", label="Tip Path",    alpha=0.5)
 
-    z_min_idx = np.argmin(tip_C[:, 2])
-    axis_length = 0.05 * 1000
+    k = np.argmin(tip_C[:, 2])   # frame closest to surface contact
+    L = 0.05 * 1000               # arrow length [mm]
 
-    # Tip frame (aligned with probe since rotation is commented out)
-    origin_tip = tip_C[z_min_idx] * 1000
-    for i, (color, label) in enumerate([('r','Tip X'),('g','Tip Y'),('b','Tip Z')]):
-        d = R_C_P[z_min_idx, :, i] * axis_length
-        ax.quiver(origin_tip[0], origin_tip[1], origin_tip[2], d[0], d[1], d[2],
-                  color=color, alpha=1.0, label=label)
+    def draw_frame(origin_mm, R_cam, colors, labels, alpha=0.8, lw=2):
+        """Draw X/Y/Z axes of a frame given its rotation matrix in Camera frame."""
+        for i, (c, lbl) in enumerate(zip(colors, labels)):
+            ax.quiver(*origin_mm, *(R_cam[:, i] * L),
+                      color=c, alpha=alpha, label=lbl, linewidth=lw)
 
-    origin_P = pP_C[z_min_idx] * 1000
-    for i, (color, label) in enumerate([('r','Probe X'),('g','Probe Y'),('b','Probe Z')]):
-        d = R_C_P[z_min_idx, :, i] * axis_length
-        ax.quiver(origin_P[0], origin_P[1], origin_P[2], d[0], d[1], d[2],
-                  color=color, alpha=0.6, label=label)
+    draw_frame(tip_C[k]*1000,        R_C_P[k] @ R_P_A,  ["r","g","b"],
+               ["Tip X","Tip Y","Tip Z"],               alpha=1.0)
+    draw_frame(pP_C[k]*1000,          R_C_P[k],           ["r","g","b"],
+               ["Probe X","Probe Y","Probe Z"],          alpha=0.6)
+    draw_frame(pB_C[k]*1000,          R_C_B[k],           ["r","g","b"],
+               ["Box X","Box Y","Box Z"],                alpha=0.6)
+    draw_frame(top_origin_C[k]*1000,  R_C_T[k],           ["r","g","b"],
+               ["Top X","Top Y","Top Z"],                alpha=0.6)
+    draw_frame(ati_origin_C[k]*1000,  R_C_A[k],           ["orange"]*3,
+               ["ATI X","ATI Y","ATI Z"],                alpha=0.8)
 
-    origin_B = pB_C[z_min_idx] * 1000
-    for i, (color, label) in enumerate([('r','Box X'),('g','Box Y'),('b','Box Z')]):
-        d = R_C_B[z_min_idx, :, i] * axis_length
-        ax.quiver(origin_B[0], origin_B[1], origin_B[2], d[0], d[1], d[2],
-                  color=color, alpha=0.6, label=label)
+    ax.set_xlabel("Camera X [mm]"); ax.set_ylabel("Camera Y [mm]"); ax.set_zlabel("Camera Z [mm]")
+    ax.set_title("Coordinate systems in Camera frame"); ax.legend()
+    all_pts = np.vstack([pP_C, pB_C, tip_C, top_origin_C, ati_origin_C]) * 1000
+    mn, mx  = all_pts.min(axis=0), all_pts.max(axis=0)
+    r = np.max(mx - mn) / 2; mid = (mn + mx) / 2
+    ax.set_xlim(mid[0]-r, mid[0]+r); ax.set_ylim(mid[1]-r, mid[1]+r)
+    ax.set_zlim(mid[2]-r, mid[2]+r); ax.set_box_aspect([1, 1, 1])
+    path = os.path.join(out_dir, f"coordinate_systems_trial{test_num}.png")
+    plt.savefig(path, dpi=220, bbox_inches="tight"); plt.show()
+    print(f"Saved: {path}")
 
-    origin_T = top_origin_C[z_min_idx] * 1000
-    for i, (color, label) in enumerate([('r','Top X'),('g','Top Y'),('b','Top Z')]):
-        d = R_C_T[z_min_idx, :, i] * axis_length
-        ax.quiver(origin_T[0], origin_T[1], origin_T[2], d[0], d[1], d[2],
-                  color=color, alpha=0.6, label=label)
 
-    origin_A = ati_origin_C[z_min_idx] * 1000
-    for i, label in enumerate(['ATI X', 'ATI Y', 'ATI Z']):
-        d = R_C_A[z_min_idx, :, i] * axis_length
-        ax.quiver(origin_A[0], origin_A[1], origin_A[2], d[0], d[1], d[2],
-                  color='orange', alpha=0.8, label=label, linewidth=2)
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8 — MAIN PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    ax.set_xlabel('Camera X [mm]')
-    ax.set_ylabel('Camera Y [mm]')
-    ax.set_zlabel('Camera Z [mm]')
-    ax.legend()
-    ax.set_title('Probe, Box, Top, and ATI Coordinate Systems in Camera Frame')
-
-    all_points = np.vstack([pP_C, pB_C, tip_C, top_origin_C, ati_origin_C]) * 1000
-    mins = all_points.min(axis=0); maxs = all_points.max(axis=0)
-    max_range = np.max(maxs - mins)
-    mid = 0.5 * (mins + maxs)
-    ax.set_xlim(mid[0]-max_range/2, mid[0]+max_range/2)
-    ax.set_ylim(mid[1]-max_range/2, mid[1]+max_range/2)
-    ax.set_zlim(mid[2]-max_range/2, mid[2]+max_range/2)
-    ax.set_box_aspect([1, 1, 1])
-
-    outpath = os.path.join(out_dir, f"coordinate_systems_trial{test_num}.png")
-    plt.savefig(outpath, dpi=220, bbox_inches="tight")
-    plt.show()
-    print(f"Saved coordinate systems plot: {outpath}")
-
-# =========================
-# Main
-# =========================
 def main(atracsys_path: str, test_num: int):
     base_dir = os.path.dirname(os.path.abspath(atracsys_path))
-    out_dir = os.path.join(base_dir, f"lin{test_num}")
-    os.makedirs(out_dir, exist_ok=True)
+    out_dir  = os.path.join(base_dir, f"lin{test_num}")
+    os.makedirs(out_dir,    exist_ok=True)
     os.makedirs(DATASET_DIR, exist_ok=True)
+    print(f"Trial {test_num}  |  Smoothing: {SMOOTH_METHOD}")
 
-    ati_path = os.path.join(base_dir, ATI_FILE)
-    atr_path = atracsys_path
-
-    print(f"Trial {test_num}")
-    print(f"Atracsys: {atr_path}")
-    print(f"ATI:      {ati_path}")
-    print(f"Smoothing: {SMOOTH_METHOD}")
-
-    ati_data = load_ati_data(ati_path)
-    df = load_atracsys_data(atr_path)
-    probe, box, probe_id = split_probe_and_box_fixed(df, box_id=BOX_TAG_ID)
-    print(f"Box tag fixed to {BOX_TAG_ID}, probe tag = {probe_id}")
-    F = asof_join(probe, box, PAIR_TOL_S)
-
+    # ── Step 1: Load raw data ─────────────────────────────────────────────────
+    ati_data = load_ati_data(os.path.join(base_dir, ATI_FILE))
+    df_tags  = load_atracsys_data(atracsys_path)
+    probe_df, box_df, probe_id = split_probe_and_box(df_tags, box_id=BOX_TAG_ID)
+    print(f"  Box tag = {BOX_TAG_ID}  |  Probe tag = {probe_id}")
+    F  = asof_join(probe_df, box_df, PAIR_TOL_S)
     tt = F["t"].to_numpy()
-    pP_C = F[["ppx","ppy","ppz"]].to_numpy()
-    pB_C = F[["bpx","bpy","bpz"]].to_numpy()
-    R_C_P = np.stack(F["PR"].to_numpy())
-    R_C_B = np.stack(F["BR"].to_numpy())
-    
-    # Stabilize box orientation to fix tracking discontinuities
-    R_C_B = stabilize_box_orientation(R_C_B)
 
-    # Tip in camera: tip_C = pP_C + R_C_P @ tip_offset_in_probe
-    tip_C = pP_C + np.einsum("nij,j->ni", R_C_P, TIP_OFFSET_IN_PROBE_M)
+    # ── Step 2: Tracked poses in Camera frame (C) ─────────────────────────────
+    pP_C  = F[["ppx","ppy","ppz"]].to_numpy()    # (N,3) probe origin in C
+    pB_C  = F[["bpx","bpy","bpz"]].to_numpy()    # (N,3) box origin in C
+    R_C_P = np.stack(F["PR"].to_numpy())           # (N,3,3) probe orientation in C
+    R_C_B = np.stack(F["BR"].to_numpy())           # (N,3,3) box orientation in C
+    R_C_B = stabilize_box_orientation(R_C_B)       # fix jitter on static box
 
-    d_T_in_B = np.array([X_SHIFT, Y_SHIFT, Z_SHIFT], dtype=float)
-    R_C_T = np.matmul(R_C_B, R_B_T)
-    top_origin_C = pB_C + np.einsum("nij,j->ni", R_C_B, d_T_in_B)
+    # ── Step 3: Build Top frame (T) from Box frame (B) ───────────────────────
+    #   top_origin_C = pB_C + R_C_B @ d_T_in_B
+    #   R_C_T        = R_C_B @ R_B_T
+    d_T_in_B     = np.array([X_SHIFT, Y_SHIFT, Z_SHIFT])
+    R_C_T        = np.matmul(R_C_B, R_B_T)                                    # (N,3,3)
+    top_origin_C = pB_C + np.einsum("nij,j->ni", R_C_B, d_T_in_B)            # (N,3)
+    R_T_C        = np.transpose(R_C_T, (0, 2, 1))                             # (N,3,3)
 
-    # Tip in Top: tip_T = R_C_T^T (tip_C - top_origin_C)
-    tip_T_raw = np.einsum("nij,nj->ni", np.transpose(R_C_T, (0,2,1)), (tip_C - top_origin_C))
-    tip_T = smooth_xyz(tip_T_raw, tt)
+    # ── Step 4: Tip position in Top frame (T) ─────────────────────────────────
+    #   tip_C   = pP_C + R_C_P @ tip_offset_in_P
+    #   tip_T   = R_T_C @ (tip_C - top_origin_C)
+    tip_C     = pP_C + np.einsum("nij,j->ni", R_C_P, TIP_OFFSET_IN_PROBE_M)  # (N,3)
+    tip_T_raw = np.einsum("nij,nj->ni", R_T_C, tip_C - top_origin_C)         # (N,3) raw
+    tip_T     = smooth_xyz(tip_T_raw, tt)                                      # (N,3) smooth
+    X_top, Y_top, Z_top = tip_T[:, 0], tip_T[:, 1], tip_T[:, 2]
 
-    X_top, Y_top, Z_top = tip_T[:,0], tip_T[:,1], tip_T[:,2]
-
+    # Optional in-plane rotation correction (aligns trajectory with box axes)
     rotation_angle_rad = 0.0
     if CORRECT_INPLANE_ROTATION:
         if MANUAL_ROTATION_ANGLE_DEG is None:
             rotation_angle_rad = estimate_inplane_rotation(X_top, Y_top)
-            print(f"Detected in-plane rotation: {np.rad2deg(rotation_angle_rad):.2f}°")
+            print(f"  Auto in-plane rotation: {np.rad2deg(rotation_angle_rad):.2f}°")
         else:
             rotation_angle_rad = np.deg2rad(MANUAL_ROTATION_ANGLE_DEG)
-            print(f"Applying manual in-plane rotation: {MANUAL_ROTATION_ANGLE_DEG:.2f}°")
+            print(f"  Manual in-plane rotation: {MANUAL_ROTATION_ANGLE_DEG:.2f}°")
         X_top, Y_top = apply_inplane_rotation(X_top, Y_top, rotation_angle_rad)
 
-    # Centered
     cx = 0.5 * (np.nanmin(X_top) + np.nanmax(X_top))
     cy = 0.5 * (np.nanmin(Y_top) + np.nanmax(Y_top))
     cz = np.nanmedian(Z_top)
     Xc, Yc, Zc = X_top - cx, Y_top - cy, Z_top - cz
 
-    # ATI origin in probe, then camera
+    # ── Step 5: Build ATI frame (A) from Probe frame (P) ─────────────────────
+    #   ATI origin in Probe frame = tip_offset + ATI_ABOVE_TIP * axial_dir
+    #   R_C_A = R_C_P @ R_P_A
     p_A_in_P = TIP_OFFSET_IN_PROBE_M + ATI_ABOVE_TIP_M * AXIAL_DIR_IN_PROBE
-    pA_C = pP_C + np.einsum("nij,j->ni", R_C_P, p_A_in_P)
-    R_C_A = R_C_P @ R_P_A
+    pA_C     = pP_C + np.einsum("nij,j->ni", R_C_P, p_A_in_P)                # (N,3)
+    R_C_A    = R_C_P @ R_P_A                                                   # (N,3,3)
 
-    # ATI in Top
-    R_T_C = np.transpose(R_C_T, (0,2,1))
-    p_A_in_T = np.einsum("nij,nj->ni", R_T_C, (pA_C - top_origin_C))
-    R_T_A = np.einsum("nij,njk->nik", R_T_C, R_C_A)
+    # ATI frame expressed in Top frame
+    p_A_in_T = np.einsum("nij,nj->ni", R_T_C, pA_C - top_origin_C)           # (N,3)
+    R_T_A    = np.einsum("nij,njk->nik", R_T_C, R_C_A)                        # (N,3,3)
 
-    # Sync ATI to tt and transform wrenches
+    # ── Step 6: Transform ATI wrench → Top frame → transfer to tip ───────────
+    #
+    #   F_top        = R_T_A @ F_A                       (rotate forces into Top axes)
+    #   M_top_origin = R_T_A @ M_A + p_A_in_T × F_top   (moment at Top origin)
+    #   M_tip        = M_top_origin − tip_T × F_top      (transfer to tip/contact point)
+    #
+    #   Combined in one step:
+    #   M_tip = R_T_A @ M_A + (p_A_in_T − tip_T_raw) × F_top
+    #                          ↑_______________________↑
+    #                          vector from tip to ATI origin, in Top frame
+    #
     times_df = pd.DataFrame({"t": tt})
     W = pd.merge_asof(
         times_df.sort_values("t"),
         ati_data.sort_values("time"),
         left_on="t", right_on="time",
-        direction="nearest", tolerance=PAIR_TOL_S
+        direction="nearest", tolerance=PAIR_TOL_S,
     ).dropna()
 
-    Fx_top = np.full(len(tt), np.nan); Fy_top = Fx_top.copy(); Fz_top = Fx_top.copy()
-    Tx_top = Fx_top.copy(); Ty_top = Fx_top.copy(); Tz_top = Fx_top.copy()
+    Fx_top = np.full(len(tt), np.nan)
+    Fy_top, Fz_top = Fx_top.copy(), Fx_top.copy()
+    Tx_top, Ty_top, Tz_top = Fx_top.copy(), Fx_top.copy(), Fx_top.copy()
 
     if len(W) > 0:
         idx = W.index.to_numpy()
-        F_A = W[["Fx","Fy","Fz"]].to_numpy(float)
-        M_A = W[["Tx","Ty","Tz"]].to_numpy(float)
-        F_T, M_T = wrench_A_to_T(R_T_A[idx], p_A_in_T[idx], F_A, M_A)
+        # Negate: ATI reports reaction force (environment→sensor); convention here
+        # is applied force (sensor→environment), so flip sign on all components.
+        F_A = -W[["Fx","Fy","Fz"]].to_numpy(float)
+        M_A = -W[["Tx","Ty","Tz"]].to_numpy(float)
 
-        Fx_top[idx], Fy_top[idx], Fz_top[idx] = F_T[:,0], F_T[:,1], F_T[:,2]
-        Tx_top[idx], Ty_top[idx], Tz_top[idx] = M_T[:,0], M_T[:,1], M_T[:,2]
-    
-    # Apply same in-plane rotation to forces/torques if position was rotated
+        # Wrench from ATI frame to Top frame, moment referenced to Top origin
+        F_top_w, M_top_w = transport_wrench(R_T_A[idx], p_A_in_T[idx], F_A, M_A)
+        Fx_top[idx], Fy_top[idx], Fz_top[idx] = F_top_w[:,0], F_top_w[:,1], F_top_w[:,2]
+        Tx_top[idx], Ty_top[idx], Tz_top[idx] = M_top_w[:,0], M_top_w[:,1], M_top_w[:,2]
+
+    # Apply same in-plane correction to force/torque XY components
     if CORRECT_INPLANE_ROTATION and rotation_angle_rad != 0.0:
-        valid = np.isfinite(Fx_top) & np.isfinite(Fy_top)
-        if np.any(valid):
-            Fx_rot, Fy_rot = apply_inplane_rotation(Fx_top, Fy_top, rotation_angle_rad)
-            Tx_rot, Ty_rot = apply_inplane_rotation(Tx_top, Ty_top, rotation_angle_rad)
-            Fx_top, Fy_top = Fx_rot, Fy_rot
-            Tx_top, Ty_top = Tx_rot, Ty_rot
-            print("Applied in-plane rotation to force/torque components.")
+        Fx_top, Fy_top = apply_inplane_rotation(Fx_top, Fy_top, rotation_angle_rad)
+        Tx_top, Ty_top = apply_inplane_rotation(Tx_top, Ty_top, rotation_angle_rad)
+        print("  Applied in-plane rotation to force/torque XY components.")
+
+    # Transfer moment from Top origin to tip (contact point)
+    F_stack      = np.vstack([Fx_top, Fy_top, Fz_top]).T
+    r_top_to_tip = tip_T_raw                          # vector Top origin → tip, in Top frame
+    r_cross_F    = np.cross(r_top_to_tip, F_stack)
+    Mx_tip = Tx_top - r_cross_F[:, 0]
+    My_tip = Ty_top - r_cross_F[:, 1]
+    Mz_tip = Tz_top - r_cross_F[:, 2]
 
     ati_top_df = pd.DataFrame({
         "time": tt,
         "Fx": Fx_top, "Fy": Fy_top, "Fz": Fz_top,
-        "Tx": Tx_top, "Ty": Ty_top, "Tz": Tz_top
+        "Tx": Tx_top, "Ty": Ty_top, "Tz": Tz_top,
     }).dropna(subset=["Fx","Fy","Fz"])
 
-    # Output CSV (same columns)
+    # ── Step 7: Save CSV ──────────────────────────────────────────────────────
     out = pd.DataFrame({
-        "t": tt,
-        "tip_x_top_m": X_top, "tip_y_top_m": Y_top, "tip_z_top_m": Z_top,
-        "tip_x_top_centered_m": Xc, "tip_y_top_centered_m": Yc, "tip_z_top_centered_m": Zc,
-        "tip_x_top_raw_m": tip_T_raw[:,0], "tip_y_top_raw_m": tip_T_raw[:,1], "tip_z_top_raw_m": tip_T_raw[:,2],
-        "tip_x_cam_m": tip_C[:,0], "tip_y_cam_m": tip_C[:,1], "tip_z_cam_m": tip_C[:,2],
-        "p_tip_probe_x_m": [TIP_OFFSET_IN_PROBE_M[0]]*len(tt),
-        "p_tip_probe_y_m": [TIP_OFFSET_IN_PROBE_M[1]]*len(tt),
-        "p_tip_probe_z_m": [TIP_OFFSET_IN_PROBE_M[2]]*len(tt),
-        "top_center_shift_m_x": [cx]*len(tt),
-        "top_center_shift_m_y": [cy]*len(tt),
-        "top_center_shift_m_z": [cz]*len(tt),
-        "inplane_rotation_correction_rad": [rotation_angle_rad]*len(tt),
-        "inplane_rotation_correction_deg": [np.rad2deg(rotation_angle_rad)]*len(tt),
-        "Fx_top_N": Fx_top, "Fy_top_N": Fy_top, "Fz_top_N": Fz_top,
-        "Tx_top_Nm": Tx_top, "Ty_top_Nm": Ty_top, "Tz_top_Nm": Tz_top,
+        # --- Tip position ---
+        "t":                             tt,
+        "tip_x_top_m":                   X_top,
+        "tip_y_top_m":                   Y_top,
+        "tip_z_top_m":                   Z_top,
+        "tip_x_top_centered_m":          Xc,
+        "tip_y_top_centered_m":          Yc,
+        "tip_z_top_centered_m":          Zc,
+        "tip_x_top_raw_m":               tip_T_raw[:, 0],
+        "tip_y_top_raw_m":               tip_T_raw[:, 1],
+        "tip_z_top_raw_m":               tip_T_raw[:, 2],
+        "tip_x_cam_m":                   tip_C[:, 0],
+        "tip_y_cam_m":                   tip_C[:, 1],
+        "tip_z_cam_m":                   tip_C[:, 2],
+        # --- Calibration metadata ---
+        "p_tip_probe_x_m":               TIP_OFFSET_IN_PROBE_M[0],
+        "p_tip_probe_y_m":               TIP_OFFSET_IN_PROBE_M[1],
+        "p_tip_probe_z_m":               TIP_OFFSET_IN_PROBE_M[2],
+        "top_center_shift_m_x":          cx,
+        "top_center_shift_m_y":          cy,
+        "top_center_shift_m_z":          cz,
+        "inplane_rotation_correction_rad": rotation_angle_rad,
+        "inplane_rotation_correction_deg": np.rad2deg(rotation_angle_rad),
+        # --- Forces at tip, expressed in Top frame axes ---
+        "Fx_top_N":                      Fx_top,
+        "Fy_top_N":                      Fy_top,
+        "Fz_top_N":                      Fz_top,
+        # --- Moment at Top origin, Top frame axes (intermediate — rarely needed) ---
+        "Tx_top_Nm":                     Tx_top,
+        "Ty_top_Nm":                     Ty_top,
+        "Tz_top_Nm":                     Tz_top,
+        # --- Moment at tip (contact point), Top frame axes  ← USE THESE ---
+        "Tx_tip_top_Nm":                 Mx_tip,
+        "Ty_tip_top_Nm":                 My_tip,
+        "Tz_tip_top_Nm":                 Mz_tip,
     })
-
-    # Torque about the tip point (Top axes)
-    r_T_to_tip = tip_T_raw
-    F_stack = np.vstack([Fx_top, Fy_top, Fz_top]).T
-    r_cross_F = np.cross(r_T_to_tip, F_stack)
-    out["Tx_tip_top_Nm"] = out["Tx_top_Nm"] - r_cross_F[:,0]
-    out["Ty_tip_top_Nm"] = out["Ty_top_Nm"] - r_cross_F[:,1]
-    out["Tz_tip_top_Nm"] = out["Tz_top_Nm"] - r_cross_F[:,2]
-
     csv_path = os.path.join(out_dir, f"tip_path_top_frame_trial{test_num}.csv")
     out.to_csv(csv_path, index=False)
     print(f"Saved CSV: {csv_path}")
+    print(f"  Tip X: [{np.min(X_top):.3f}, {np.max(X_top):.3f}] m")
+    print(f"  Tip Y: [{np.min(Y_top):.3f}, {np.max(Y_top):.3f}] m")
+    print(f"  Tip Z: {np.mean(Z_top):.3f} ± {np.std(Z_top):.3f} m")
 
-    print("Tip position statistics (Top frame, unflattened):")
-    print(f"X range: [{np.min(X_top):.3f}, {np.max(X_top):.3f}] m")
-    print(f"Y range: [{np.min(Y_top):.3f}, {np.max(Y_top):.3f}] m")
-    print(f"Z mean ± std: {np.mean(Z_top):.3f} ± {np.std(Z_top):.3f} m")
+    processing_data = pd.merge_asof(
+        pd.DataFrame({"time": tt,
+                      "x_position_mm": X_top*1000,
+                      "y_position_mm": Y_top*1000,
+                      "z_position_mm": Z_top*1000}).sort_values("time"),
+        ati_top_df.sort_values("time"),
+        on="time", direction="nearest", tolerance=PAIR_TOL_S,
+    ).dropna(subset=["Fx","Fy","Fz"])
+    proc_path = os.path.join(DATASET_DIR, f"processing_test_{test_num}.csv")
+    processing_data.to_csv(proc_path, index=False)
+    print(f"Saved processing data: {proc_path}")
 
-    # Plots
-    plot_ati_wrenches(out_dir, ati_data, test_num, frame_label="ATI Frame")
+    # ── Step 8: Plots ─────────────────────────────────────────────────────────
+    plot_ati_wrenches(out_dir, ati_data,   test_num, frame_label="ATI Frame")
     plot_ati_wrenches(out_dir, ati_top_df, test_num, frame_label="Top Frame")
     plot_top_xy(out_dir, X_top, Y_top, Z_top, test_num)
     plot_top_3d(out_dir, X_top, Y_top, Z_top, test_num, z_limit_mm=Z_LIMIT_MM_2D)
-
     if not ati_top_df.empty:
         plot_top_path_with_forces(out_dir, X_top, Y_top, Z_top, tt, ati_top_df, test_num)
+    plot_coordinate_systems(out_dir, pP_C, pB_C, tip_C, R_C_P, R_C_B, R_C_T,  top_origin_C, pA_C, R_C_A, test_num)
 
-    plot_coordinate_systems(
-        out_dir,
-        pP_C, pB_C, tip_C,
-        R_C_P, R_C_B, R_C_T,
-        top_origin_C, pA_C, R_C_A,
-        test_num
-    )
-
-    # Processing file (same idea)
-    tip_data = pd.DataFrame({
-        "time": tt,
-        "x_position_mm": X_top * 1000,
-        "y_position_mm": Y_top * 1000,
-        "z_position_mm": Z_top * 1000,
-    }).sort_values("time")
-
-    processing_data = pd.merge_asof(
-        tip_data, ati_top_df.sort_values("time"),
-        on="time", direction="nearest", tolerance=PAIR_TOL_S
-    ).dropna(subset=["Fx","Fy","Fz"])
-
-    processing_path = os.path.join(DATASET_DIR, f"processing_test_{test_num}.csv")
-    processing_data.to_csv(processing_path, index=False)
-    print(f"Saved processing data: {processing_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--atracsys", type=str, default=None)
-    parser.add_argument("--test", type=int, default=TEST_NUM)
+    parser.add_argument("--test",     type=int, default=TEST_NUM)
     args = parser.parse_args()
-
-    atr_path = args.atracsys or os.path.join(DATASET_DIR, ATRACSYS_FILE)
-    main(atr_path, args.test)
+    main(args.atracsys or os.path.join(DATASET_DIR, ATRACSYS_FILE), args.test)

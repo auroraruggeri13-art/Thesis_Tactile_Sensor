@@ -53,7 +53,7 @@ else:
 # ============================================================
 
 DATA_DIRECTORY = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\train_validation_test_data"
-sensor_version = 5.12
+sensor_version = 5.17
 TRAIN_FILENAME = f"train_data_v{sensor_version}.csv"
 VALIDATION_FILENAME = f"validation_data_v{sensor_version}.csv"
 TEST_FILENAME  = f"test_data_v{sensor_version}.csv"
@@ -490,7 +490,7 @@ def main():
     save_dir = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\models parameters\averaged models"
     os.makedirs(save_dir, exist_ok=True)
 
-    version = f'v{sensor_version:.1f}'
+    version = f'v{sensor_version:.2f}'
 
     # Save scaler
     scaler_path = os.path.join(save_dir, f'scaler_lstm_{version}.pkl')
@@ -499,7 +499,7 @@ def main():
     print(f"Scaler saved to: {scaler_path}")
 
     # Save model
-    model_path = os.path.join(save_dir, f'lstm_model_{version}.h5')
+    model_path = os.path.join(save_dir, f'lstm_model_{version}.keras')
     model.save(model_path)
     print(f"LSTM model saved to: {model_path}")
 

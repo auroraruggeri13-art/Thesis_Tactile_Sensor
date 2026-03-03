@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 # ===================== EDIT THESE IN VS CODE =====================
-TRIAL = 51092
+TRIAL = 52001
 DATA_DIR = Path(r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data\test {} - sensor v5".format(TRIAL))
 
 TAG0_FILE = DATA_DIR / f"{TRIAL}tag0_pose_trial.txt"
@@ -259,7 +259,7 @@ if __name__ == "__main__":
     plot_tags_3d({"tag0": tag0, "tag1": tag1, "tag2": tag2}, units="mm")
     
     # ---- 2D projections of probe path in probe reference frame ----
-    plot_probe_2d_projections(tag1, units="mm")  # tag1 is the probe
+    plot_probe_2d_projections(tag2, units="mm")  # tag2 is the probe (moving)
 
     # ---- Export ONLY tag1+tag2 for your existing pipeline ----
     export_atracsys_like(pd.concat([tag1, tag2], ignore_index=True), OUT_ATRACSYS_LIKE)

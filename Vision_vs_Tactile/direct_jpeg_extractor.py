@@ -30,6 +30,7 @@ from utils.barometer_processing import (  # type: ignore[import]
     load_barometer_data,
     process_barometers,
     rezero_barometers_when_fz_zero,
+    plot_barometers_subplots,
 )
 
 # interactive HSV colour picker (same directory as this script)
@@ -38,7 +39,24 @@ from hsv_color_picker import pick_hsv_bounds, patch_processor
 
 # =========================== CONFIGURATION ===========================
 
-test_num = 51011009
+test_num = 51819003
+# Geometric offsets in object-tag frame O (tag id=1)
+TIP_OFFSET_FROM_ATI_M      = 15/1000   # +15 mm along Z_A (external direction)
+
+# Top surface of tactile sensor in gripper tag frame G (tag id=0)
+# [x, y, z] in metres:  x = +20 mm,  y = -50 mm,  z = -14 mm
+P_G_SURFACE_RIGHT = np.array([+20/1000, -100/1000, -14/1000], dtype=float)
+P_G_SURFACE_LEFT  = np.array([-20/1000, -50/1000, -14/1000], dtype=float)
+
+# Top surface frame orientation in gripper tag frame G:
+#   X_S = -Y_G,  Y_S = -Z_G,  Z_S = +X_G  (RIGHT)
+X_S_IN_G = np.array([ 0.0, -1.0,  0.0], dtype=float)   # X_S = -Y_G
+Z_S_IN_G = np.array([+1.0,  0.0,  0.0], dtype=float)   # Z_S = +X_G
+
+# Left top surface frame — mirrored from right (Z_S reversed):
+#   X_S = +Y_G,  Y_S = -Z_G,  Z_S = -X_G  (LEFT)
+X_S_IN_G_LEFT = np.array([ 0.0, +1.0,  0.0], dtype=float)   # X_S = +Y_G (opposite to right)
+Z_S_IN_G_LEFT = np.array([-1.0,  0.0,  0.0], dtype=float)   # Z_S = -X_G (opposite to right)
 
 # --- Barometer processing params ---
 WARMUP_DURATION            = 2.0
@@ -60,7 +78,7 @@ ASOF_TOLERANCE_S           = 0.05
 
 # --- Dynamic re-zero based on Fz ~ 0 ---
 ENABLE_DYNAMIC_REZERO      = True
-FZ_ZERO_THRESHOLD          = 0.2
+FZ_ZERO_THRESHOLD          = 0.5
 MIN_ZERO_DURATION_S        = 0.01
 MIN_ZERO_SAMPLES           = 5
 
@@ -78,15 +96,18 @@ HSV_PURPLE_LOWER = np.array([106,  16,  54])   # [H_min, S_min, V_min]
 HSV_PURPLE_UPPER = np.array([154, 122, 175])   # [H_max, S_max, V_max]
 
 # --- HSV colour bounds for the green object ---
-# Teal-green fin ray gripper: H 48-92, V≥38 keeps shadowed gripper areas
-# while rejecting truly dark cables (V<30). S≥60 keeps real saturation.
-HSV_GREEN_LOWER  = np.array([ 48,  60,  38])   # [H_min, S_min, V_min]
-HSV_GREEN_UPPER  = np.array([ 92, 255, 215])   # [H_max, S_max, V_max]
+# Vivid lime/neon green fin-ray gripper.
+# H 50-92 : covers full lime-green range incl. slightly teal upper ribs.
+# S ≥ 70  : rejects near-grey cables/skin while keeping washed-out gripper tips.
+# V ≥ 40  : keeps shadowed inner ribs; rejects truly dark noise.
+# V ≤ 255 : allow full brightness on reflective plastic.
+HSV_GREEN_LOWER  = np.array([ 50,  70,  40])   # [H_min, S_min, V_min]
+HSV_GREEN_UPPER  = np.array([ 92, 255, 255])   # [H_max, S_max, V_max]
 
 # Optional: exclude a colour range (e.g. yellow background, skin tones).
 # Set to None to disable.
-HSV_EXCLUDE_LOWER = np.array([ 52,   0,   2])
-HSV_EXCLUDE_UPPER = np.array([ 89, 154, 135])
+HSV_EXCLUDE_LOWER = None
+HSV_EXCLUDE_UPPER = None
 
 # --- ROI (Region of Interest) — fractions of image size (0.0 – 1.0) ---
 # Anything outside this rectangle is zeroed before segmentation to suppress
@@ -98,6 +119,75 @@ ROI_FRAC: tuple | None = (0.10, 0.02, 0.87, 0.85)
 # --- HSV picker display settings (only used when USE_HSV_PICKER = True) ---
 PICKER_PREVIEW_MAX_DIM     = 900
 PICKER_FRAME_IDX: int | None = None
+
+# --- AprilTag + force-frame transformation ---
+ENABLE_APRILTAG_DETECTION  = True
+APRILTAG_TAG_SIZE_M        = 0.02   # 2 cm x 2 cm
+APRILTAG_GRIPPER_ID        = 0
+APRILTAG_OBJECT_ID         = 1
+APRILTAG_DICT_NAME         = "DICT_APRILTAG_36h11"
+APRILTAG_DEBUG_DRAW        = True
+APRILTAG_DEBUG_AXIS_LEN_M  = 0.01
+APRILTAG_DEBUG_FRAME_NAME  = "apriltag_debug_frame.jpg"
+FORCE_DEBUG_FRAME_NAME     = "force_surface_debug_frame.jpg"
+FORCE_ARROW_SCALE_M_PER_N  = 0.002   # m per N — arrow length in 3D for force debug frame
+
+# ATI reports reaction force. Set True to export applied force at contact.
+FLIP_REACTION_FORCE_SIGN   = True
+
+# ATI origins expressed in object tag frame O [x, y, z] in metres
+#   z: +140 mm (above object tag)
+#   y: +70.5 mm
+#   x: +31 mm (right ATI), -40 mm (left ATI)
+P_O_ATI_RIGHT = np.array([-42/1000,  +39/1000, +25/1000], dtype=float)
+P_O_ATI_LEFT  = np.array([-3/1000,  +39/1000, +25/1000], dtype=float)
+
+# ATI frame axes expressed in object tag frame O.
+# Columns are [x_A, y_A, z_A] expressed in O.
+#   x_A = +z_O (aligned with Z of tag 1) for both ATIs
+#   z_A = -x_O (right ATI), z_A = +x_O (left ATI)
+#   y_A is computed with right-hand rule: y_A = z_A × x_A
+X_A_IN_G_RIGHT = np.array([0.0,  0.0, +1.0], dtype=float)   # = +Z_O
+Z_A_IN_G_RIGHT = np.array([-1.0, 0.0,  0.0], dtype=float)
+X_A_IN_G_LEFT  = np.array([0.0,  0.0, +1.0], dtype=float)   # = +Z_O
+Z_A_IN_G_LEFT  = np.array([+1.0, 0.0,  0.0], dtype=float)
+
+
+def _normalize(v: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(v)
+    if n < 1e-12:
+        raise ValueError("Zero-length axis in frame definition.")
+    return v / n
+
+
+def build_rotation_from_x_and_z(x_axis_in_parent: np.ndarray,
+                                z_axis_in_parent: np.ndarray) -> np.ndarray:
+    """
+    Build a right-handed rotation matrix with columns [x, y, z].
+    Inputs are x and z axes expressed in parent frame.
+    """
+    x = _normalize(x_axis_in_parent)
+    z = _normalize(z_axis_in_parent)
+    if abs(float(np.dot(x, z))) > 1e-6:
+        raise ValueError("x and z axes must be orthogonal.")
+    y = _normalize(np.cross(z, x))
+    x = _normalize(np.cross(y, z))  # re-orthogonalize x
+    return np.column_stack((x, y, z))
+
+
+def rotation_to_zyx_euler_deg(R: np.ndarray) -> tuple[float, float, float]:
+    """Return yaw(Z), pitch(Y), roll(X) in degrees from rotation matrix."""
+    sy = np.sqrt(R[0, 0]**2 + R[1, 0]**2)
+    singular = sy < 1e-8
+    if not singular:
+        yaw = np.arctan2(R[1, 0], R[0, 0])
+        pitch = np.arctan2(-R[2, 0], sy)
+        roll = np.arctan2(R[2, 1], R[2, 2])
+    else:
+        yaw = np.arctan2(-R[0, 1], R[1, 1])
+        pitch = np.arctan2(-R[2, 0], sy)
+        roll = 0.0
+    return float(np.degrees(yaw)), float(np.degrees(pitch)), float(np.degrees(roll))
 
 
 # ======================== IMAGE EXTRACTION ============================
@@ -118,6 +208,8 @@ class RosBagImageExtractor:
 
     def __init__(self, bag_path):
         self.bag_path = Path(bag_path)
+        self.camera_matrix = None
+        self.dist_coeffs = None
 
     @staticmethod
     def _raw_to_bgr(data, height, width, encoding):
@@ -132,6 +224,15 @@ class RosBagImageExtractor:
         elif encoding in ('mono8', '8UC1'):
                                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         return img
+
+    @staticmethod
+    def _camera_info_to_intrinsics(msg):
+        # rosbags exposes fields with their original capitalisation (K, D)
+        k_attr = getattr(msg, 'K', None) if hasattr(msg, 'K') else msg.k
+        d_attr = getattr(msg, 'D', None) if hasattr(msg, 'D') else msg.d
+        k = np.array(k_attr, dtype=float).reshape(3, 3)
+        d = np.array(d_attr, dtype=float).reshape(-1, 1)
+        return k, d
 
     def extract_all_images(self):
         print(f"Reading bag file: {self.bag_path}")
@@ -150,15 +251,39 @@ class RosBagImageExtractor:
 
             topic_name = image_connections[0].topic
             print(f"  Using topic: {topic_name}")
+            image_connection = image_connections[0]
+
+            # Try to recover camera intrinsics from camera_info.
+            image_prefix = topic_name.rsplit('/', 1)[0]
+            caminfo_connections = [
+                c for c in reader.connections
+                if c.msgtype in ('sensor_msgs/msg/CameraInfo', 'sensor_msgs/CameraInfo')
+            ]
+            chosen_caminfo = None
+            for c in caminfo_connections:
+                if c.topic.startswith(image_prefix):
+                    chosen_caminfo = c
+                    break
+            if chosen_caminfo is None and caminfo_connections:
+                chosen_caminfo = caminfo_connections[0]
+
+            if chosen_caminfo is not None:
+                for connection, _, rawdata in reader.messages(connections=[chosen_caminfo]):
+                    msg = reader.deserialize(rawdata, connection.msgtype)
+                    self.camera_matrix, self.dist_coeffs = self._camera_info_to_intrinsics(msg)
+                    print(f"  Camera intrinsics loaded from: {chosen_caminfo.topic}")
+                    break
+            else:
+                print("  Warning: no CameraInfo topic found in bag.")
 
             msg_count = sum(
-                c.msgcount for c in image_connections
+                c.msgcount for c in [image_connection]
                 if hasattr(c, 'msgcount') and c.msgcount
             )
 
             idx = 0
             for connection, timestamp, rawdata in tqdm(
-                reader.messages(connections=image_connections),
+                reader.messages(connections=[image_connection]),
                 total=msg_count if msg_count else None,
                 desc="Extracting images"
             ):
@@ -176,7 +301,7 @@ class RosBagImageExtractor:
                 idx += 1
 
         print(f"Successfully extracted {len(images)} images with timestamps")
-        return images
+        return images, self.camera_matrix, self.dist_coeffs
 
 
 # ======================== FIN RAY PROCESSOR ===========================
@@ -220,6 +345,20 @@ class FinRayProcessor:
         self.baro_left       = None
         self.baro_right      = None
         self.synchronized_df = None
+        self.camera_matrix   = None
+        self.dist_coeffs     = None
+        self._apriltag_detector = None
+        self._debug_frame_saved = False
+        self.R_G_A_right = build_rotation_from_x_and_z(X_A_IN_G_RIGHT, Z_A_IN_G_RIGHT)
+        self.R_G_A_left  = build_rotation_from_x_and_z(X_A_IN_G_LEFT,  Z_A_IN_G_LEFT)
+        print(f"[DEBUG] X_A_IN_G_LEFT={X_A_IN_G_LEFT}  Z_A_IN_G_LEFT={Z_A_IN_G_LEFT}")
+        print(f"[DEBUG] R_G_A_left =\n{self.R_G_A_left}")
+        self.p_tip_in_ati = np.array([0.0, 0.0, TIP_OFFSET_FROM_ATI_M], dtype=float)
+        self.R_G_S      = build_rotation_from_x_and_z(X_S_IN_G,      Z_S_IN_G)
+        self.R_G_S_left = build_rotation_from_x_and_z(X_S_IN_G_LEFT, Z_S_IN_G_LEFT)
+        self._force_debug_saved = False
+
+        self._init_apriltag_detector()
 
     # ------------------------------------------------------------------ ATI
 
@@ -247,8 +386,233 @@ class FinRayProcessor:
 
     def extract_images(self, bag_file):
         print("\nExtracting images from bag file...")
-        self.images = RosBagImageExtractor(bag_file).extract_all_images()
+        extractor = RosBagImageExtractor(bag_file)
+        self.images, self.camera_matrix, self.dist_coeffs = extractor.extract_all_images()
+        if self.camera_matrix is None:
+            print("  Warning: camera intrinsics unavailable; AprilTag pose estimation disabled.")
+        else:
+            fx = self.camera_matrix[0, 0]
+            fy = self.camera_matrix[1, 1]
+            print(f"  Camera intrinsics ready (fx={fx:.2f}, fy={fy:.2f})")
         return self.images
+
+    # ------------------------------------------------------------------ apriltag
+
+    def _init_apriltag_detector(self):
+        if not ENABLE_APRILTAG_DETECTION:
+            return
+        if not hasattr(cv2, "aruco"):
+            print("  Warning: cv2.aruco not available (install opencv-contrib-python).")
+            return
+        dict_id = getattr(cv2.aruco, APRILTAG_DICT_NAME, None)
+        if dict_id is None:
+            raise ValueError(f"Unknown AprilTag dictionary: {APRILTAG_DICT_NAME}")
+        tag_dict = cv2.aruco.getPredefinedDictionary(dict_id)
+        params = cv2.aruco.DetectorParameters()
+        self._apriltag_detector = cv2.aruco.ArucoDetector(tag_dict, params)
+
+    def detect_apriltags(self, image):
+        """
+        Detect AprilTags and estimate pose in camera frame.
+
+        Returns
+        -------
+        dict[id] = {
+            'corners': (4,2),
+            'rvec': (3,),
+            'tvec': (3,),
+            'R_C_tag': (3,3)
+        }
+        """
+        if not ENABLE_APRILTAG_DETECTION or self._apriltag_detector is None:
+            return {}
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = self._apriltag_detector.detectMarkers(gray)
+        if ids is None or len(ids) == 0:
+            return {}
+
+        detections = {}
+        ids_flat = ids.flatten().tolist()
+        if self.camera_matrix is None:
+            for tag_id, c in zip(ids_flat, corners):
+                detections[int(tag_id)] = {'corners': c.reshape(4, 2)}
+            return detections
+
+        half = APRILTAG_TAG_SIZE_M / 2.0
+        obj_pts = np.array([
+            [-half,  half, 0],
+            [ half,  half, 0],
+            [ half, -half, 0],
+            [-half, -half, 0],
+        ], dtype=np.float32)
+        rvecs, tvecs = [], []
+        for c in corners:
+            _, rvec, tvec = cv2.solvePnP(
+                obj_pts, c.reshape(4, 2), self.camera_matrix, self.dist_coeffs,
+                flags=cv2.SOLVEPNP_IPPE_SQUARE
+            )
+            rvecs.append(rvec)
+            tvecs.append(tvec)
+        for i, tag_id in enumerate(ids_flat):
+            rvec = rvecs[i].reshape(3)
+            tvec = tvecs[i].reshape(3)
+            R_C_tag, _ = cv2.Rodrigues(rvec)
+            detections[int(tag_id)] = {
+                'corners': corners[i].reshape(4, 2),
+                'rvec': rvec,
+                'tvec': tvec,
+                'R_C_tag': R_C_tag,
+            }
+        return detections
+
+    def _draw_frame_axes(self, image, R_C_F, p_F_C, axis_len_m=0.01, label=None):
+        """Draw 3D frame axes projected in the image."""
+        if self.camera_matrix is None:
+            return image
+        pts_F = np.array([
+            [0.0, 0.0, 0.0],
+            [axis_len_m, 0.0, 0.0],
+            [0.0, axis_len_m, 0.0],
+            [0.0, 0.0, axis_len_m],
+        ], dtype=np.float32)
+        pts_C = (R_C_F @ pts_F.T).T + p_F_C.reshape(1, 3)
+        img_pts, _ = cv2.projectPoints(
+            pts_C, np.zeros(3), np.zeros(3), self.camera_matrix, self.dist_coeffs
+        )
+        img_pts = img_pts.reshape(-1, 2).astype(int)
+        o, x, y, z = img_pts
+        cv2.line(image, tuple(o), tuple(x), (0, 0, 255), 2)   # X red
+        cv2.line(image, tuple(o), tuple(y), (0, 255, 0), 2)   # Y green
+        cv2.line(image, tuple(o), tuple(z), (255, 0, 0), 2)   # Z blue
+        if label:
+            cv2.putText(image, label, tuple(o + np.array([6, -6])),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+        return image
+
+    def _save_apriltag_debug_frame(self, image, detections):
+        if self._debug_frame_saved or not APRILTAG_DEBUG_DRAW:
+            return
+        if self.camera_matrix is None:
+            return
+        if APRILTAG_OBJECT_ID not in detections:
+            return
+
+        debug = image.copy()
+        if hasattr(cv2, "aruco"):
+            cv2.aruco.drawDetectedMarkers(
+                debug,
+                [d['corners'].reshape(1, 4, 2).astype(np.float32) for d in detections.values()],
+                np.array(list(detections.keys()), dtype=np.int32).reshape(-1, 1),
+            )
+
+        # Draw tag frames.
+        for tag_id in [APRILTAG_GRIPPER_ID, APRILTAG_OBJECT_ID]:
+            det = detections.get(tag_id)
+            if det is None or 'rvec' not in det:
+                continue
+            cv2.drawFrameAxes(
+                debug, self.camera_matrix, self.dist_coeffs,
+                det['rvec'], det['tvec'], APRILTAG_DEBUG_AXIS_LEN_M
+            )
+
+        # Draw ATI and contact frames derived from object tag.
+        det_o = detections[APRILTAG_OBJECT_ID]
+        R_C_O = det_o['R_C_tag']
+        p_O_C = det_o['tvec']
+
+        for side in ['R', 'L']:
+            R_O_A = self.R_G_A_right if side == 'R' else self.R_G_A_left
+            p_A_in_O = P_O_ATI_RIGHT if side == 'R' else P_O_ATI_LEFT
+            R_C_A = R_C_O @ R_O_A
+            p_A_C = p_O_C + R_C_O @ p_A_in_O
+            p_tip_C = p_A_C + R_C_A @ self.p_tip_in_ati
+            self._draw_frame_axes(debug, R_C_A, p_A_C,   axis_len_m=0.008, label=f"ATI {side}")
+            self._draw_frame_axes(debug, R_C_A, p_tip_C, axis_len_m=0.006, label=f"T {side}")
+
+        # Draw top surface frames anchored to gripper tag (tag 0) — tracks jaw motion.
+        det_g = detections.get(APRILTAG_GRIPPER_ID)
+        if det_g is not None and 'R_C_tag' in det_g:
+            R_C_G = det_g['R_C_tag']
+            p_G_C = det_g['tvec']
+            R_C_S = R_C_G @ self.R_G_S
+            p_surf_C = p_G_C + R_C_G @ P_G_SURFACE_RIGHT
+            self._draw_frame_axes(debug, R_C_S, p_surf_C, axis_len_m=0.007, label="S R")
+
+        out = self.output_dir / APRILTAG_DEBUG_FRAME_NAME
+        cv2.imwrite(str(out), debug)
+        print(f"  Saved AprilTag debug frame -> {out}")
+        self._debug_frame_saved = True
+
+    def save_one_apriltag_debug_frame(self):
+        """Scan extracted frames and save one debug image with coordinate systems."""
+        if not self.images:
+            print("  Warning: no images available for AprilTag debug frame.")
+            return
+        if not ENABLE_APRILTAG_DETECTION:
+            return
+        self._debug_frame_saved = False  # force regeneration when called explicitly
+        for img in self.images:
+            detections = self.detect_apriltags(img['image'])
+            if APRILTAG_OBJECT_ID in detections:
+                self._save_apriltag_debug_frame(img['image'], detections)
+                break
+        if not self._debug_frame_saved:
+            print("  Warning: could not find a frame with object tag for debug drawing.")
+
+    def _save_force_surface_debug_frame(self, image, detections, wrench_R, wrench_L):
+        """
+        Save one debug image showing the right surface frame axes and force arrows
+        (for both L and R) drawn on the top surface of the sensor.
+        Left surface frame axes are NOT drawn (only used for the arrow origin).
+        """
+        if self._force_debug_saved:
+            return
+        if self.camera_matrix is None:
+            return
+        det_g = detections.get(APRILTAG_GRIPPER_ID)
+        if det_g is None or 'R_C_tag' not in det_g:
+            return
+        F_R = wrench_R.get('force_surf', self._nan_vec3())
+        F_L = wrench_L.get('force_surf', self._nan_vec3())
+        if not (np.isfinite(F_R).all() or np.isfinite(F_L).all()):
+            return
+
+        debug = image.copy()
+        R_C_G = det_g['R_C_tag']
+        p_G_C = det_g['tvec']
+
+        # Draw surface frame axes for RIGHT side only
+        R_C_S_right = R_C_G @ self.R_G_S
+        p_surf_R_C  = p_G_C + R_C_G @ P_G_SURFACE_RIGHT
+        self._draw_frame_axes(debug, R_C_S_right, p_surf_R_C, axis_len_m=0.007, label="S R")
+
+        # Force arrows for both sides
+        for side, R_G_S_side, P_surf, F_S in [
+            ('R', self.R_G_S,      P_G_SURFACE_RIGHT, F_R),
+            ('L', self.R_G_S_left, P_G_SURFACE_LEFT,  F_L),
+        ]:
+            if not np.isfinite(F_S).all():
+                continue
+            p_orig_C = p_G_C + R_C_G @ P_surf
+            # Force direction in camera frame: R_C_G @ R_G_S_side @ F_S
+            R_C_S = R_C_G @ R_G_S_side
+            F_cam = R_C_S @ F_S
+            p_tip_C = p_orig_C + F_cam * FORCE_ARROW_SCALE_M_PER_N
+            pts, _ = cv2.projectPoints(
+                np.array([p_orig_C, p_tip_C], dtype=np.float32),
+                np.zeros(3), np.zeros(3), self.camera_matrix, self.dist_coeffs
+            )
+            pts = pts.reshape(-1, 2).astype(int)
+            color = (0, 140, 255) if side == 'R' else (255, 140, 0)   # orange / blue-orange
+            cv2.arrowedLine(debug, tuple(pts[0]), tuple(pts[1]), color, 2, tipLength=0.3)
+            label = f"F{side}=({F_S[0]:.1f},{F_S[1]:.1f},{F_S[2]:.1f})N"
+            cv2.putText(debug, label, tuple(pts[0] + np.array([5, -8])),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA)
+
+        out = self.output_dir / FORCE_DEBUG_FRAME_NAME
+        cv2.imwrite(str(out), debug)
+        print(f"  Saved force surface debug frame -> {out}")
+        self._force_debug_saved = True
 
     # ------------------------------------------------------------------ interactive HSV picker
 
@@ -329,6 +693,59 @@ class FinRayProcessor:
     def synchronize_all(self):
         print("\nSynchronizing all data streams...")
 
+        # --- Rezero baro data BEFORE image merge (runs at baro frequency → no NaN issue) ---
+        if ENABLE_DYNAMIC_REZERO:
+            for side, baro_attr, ati_attr in [
+                ('L', 'baro_left',  'ati_data_left'),
+                ('R', 'baro_right', 'ati_data_right'),
+            ]:
+                baro_df = getattr(self, baro_attr)
+                ati_df  = getattr(self, ati_attr)
+                if baro_df is None or ati_df is None:
+                    continue
+                fz_col         = f'force_z_{side}'
+                baro_cols_side = [f'b{i}_{side}' for i in range(1, 7)
+                                  if f'b{i}_{side}' in baro_df.columns]
+                if not baro_cols_side or fz_col not in ati_df.columns:
+                    continue
+
+                # Merge ATI Fz onto baro timestamps
+                baro_fz = pd.merge_asof(
+                    baro_df.sort_values('time').reset_index(drop=True),
+                    ati_df[['time', fz_col]].sort_values('time'),
+                    on='time', direction='nearest', tolerance=0.1,
+                )
+
+                # Rename to generic names required by rezero function
+                to_gen  = {fz_col: 'Fz', **{f'b{i}_{side}': f'b{i}'
+                           for i in range(1, 7) if f'b{i}_{side}' in baro_fz.columns}}
+                from_gen = {v: k for k, v in to_gen.items()}
+                baro_fz  = baro_fz.rename(columns=to_gen)
+                baro_fz  = rezero_barometers_when_fz_zero(
+                    baro_fz,
+                    fz_threshold=FZ_ZERO_THRESHOLD,
+                    min_zero_duration=MIN_ZERO_DURATION_S,
+                    min_samples=MIN_ZERO_SAMPLES,
+                )
+                baro_fz  = baro_fz.rename(columns=from_gen)
+
+                # Write rezeroed baro columns back into self.baro_left / self.baro_right
+                baro_df = baro_df.sort_values('time').reset_index(drop=True)
+                for col in baro_cols_side:
+                    baro_df[col] = baro_fz[col].values
+                setattr(self, baro_attr, baro_df)
+
+                # 4th plot: barometers after rezeroing (at baro frequency, full time range)
+                subdir  = 'barometers_left' if side == 'L' else 'barometers_right'
+                plot_df = baro_fz[['time'] + baro_cols_side].rename(
+                    columns={f'b{i}_{side}': f'b{i}' for i in range(1, 7)})
+                plot_barometers_subplots(
+                    plot_df,
+                    save_path=self.plots_dir / subdir / '4_barometers_after_rezeroing.png',
+                    suptitle=f'Barometers (after Fz=0 rezeroing – side {side})',
+                )
+                print(f"  Saved 4th plot (rezeroed barometers side {side})")
+
         img_df = pd.DataFrame([
             {'image_idx': img['index'], 'time': img['timestamp_sec']}
             for img in self.images
@@ -374,26 +791,6 @@ class FinRayProcessor:
 
         fz_cols = [c for c in ['force_z_R', 'force_z_L'] if c in merged.columns]
         merged  = merged.dropna(subset=fz_cols).reset_index(drop=True)
-
-        if ENABLE_DYNAMIC_REZERO:
-            for side in ['L', 'R']:
-                fz_col    = f'force_z_{side}'
-                side_cols = [f'b{i}_{side}' for i in range(1, 7)
-                             if f'b{i}_{side}' in merged.columns]
-                if not side_cols or fz_col not in merged.columns:
-                    continue
-                to_generic   = {fz_col: 'Fz'}
-                to_generic.update({f'b{i}_{side}': f'b{i}' for i in range(1, 7)
-                                   if f'b{i}_{side}' in merged.columns})
-                from_generic = {v: k for k, v in to_generic.items()}
-                merged = merged.rename(columns=to_generic)
-                merged = rezero_barometers_when_fz_zero(
-                    merged,
-                    fz_threshold=FZ_ZERO_THRESHOLD,
-                    min_zero_duration=MIN_ZERO_DURATION_S,
-                    min_samples=MIN_ZERO_SAMPLES,
-                )
-                merged = merged.rename(columns=from_generic)
 
         self.synchronized_df = merged
         print(f"  Final synchronized dataset: {len(merged)} rows")
@@ -594,6 +991,76 @@ class FinRayProcessor:
 
         return purple_mask, green_mask
 
+    @staticmethod
+    def _nan_vec3():
+        return np.array([np.nan, np.nan, np.nan], dtype=float)
+
+    def _transform_wrench_to_object(self, row, detections, side):
+        """
+        Transform ATI wrench from local ATI frame to object-tag frame.
+
+        Returns dict with transformed force/torque at contact, plus raw/applied vectors.
+        """
+        out = {
+            'has_tag_pair': False,
+            'force_applied_ati': self._nan_vec3(),
+            'torque_applied_ati': self._nan_vec3(),
+            'force_obj': self._nan_vec3(),
+            'torque_obj': self._nan_vec3(),
+            'force_tip_obj': self._nan_vec3(),
+            'torque_tip_obj': self._nan_vec3(),
+            'force_surf': self._nan_vec3(),
+            'torque_surf': self._nan_vec3(),
+        }
+
+        det_o = detections.get(APRILTAG_OBJECT_ID)
+        if det_o is None or 'R_C_tag' not in det_o:
+            return out
+
+        fx = float(getattr(row, f'force_x_{side}', np.nan))
+        fy = float(getattr(row, f'force_y_{side}', np.nan))
+        fz = float(getattr(row, f'force_z_{side}', np.nan))
+        tx = float(getattr(row, f'torque_x_{side}', np.nan))
+        ty = float(getattr(row, f'torque_y_{side}', np.nan))
+        tz = float(getattr(row, f'torque_z_{side}', np.nan))
+        if not np.isfinite([fx, fy, fz, tx, ty, tz]).all():
+            return out
+
+        F_A = np.array([fx, fy, fz], dtype=float)
+        M_A = np.array([tx, ty, tz], dtype=float)
+        if FLIP_REACTION_FORCE_SIGN:
+            F_A = -F_A
+            M_A = -M_A
+        out['force_applied_ati'] = F_A
+        out['torque_applied_ati'] = M_A
+
+        R_O_A = self.R_G_A_right if side == 'R' else self.R_G_A_left
+        F_O = R_O_A @ F_A
+        M_O = R_O_A @ M_A
+
+        # Transfer moment to tip origin (15 mm along Z_A, expressed in ATI frame)
+        M_tip_A = M_A + np.cross(self.p_tip_in_ati, F_A)
+        F_tip_O = F_O
+        M_tip_O = R_O_A @ M_tip_A
+
+        out['force_obj'] = F_O
+        out['torque_obj'] = M_O
+        out['force_tip_obj'] = F_tip_O
+        out['torque_tip_obj'] = M_tip_O
+
+        # Express force in top surface frame (requires gripper tag for R_G_O)
+        det_g = detections.get(APRILTAG_GRIPPER_ID)
+        if det_g is not None and 'R_C_tag' in det_g:
+            R_G_O = det_g['R_C_tag'].T @ det_o['R_C_tag']
+            R_G_S_side = self.R_G_S if side == 'R' else self.R_G_S_left
+            F_G = R_G_O @ F_O
+            M_G = R_G_O @ M_O
+            out['force_surf']  = R_G_S_side.T @ F_G
+            out['torque_surf'] = R_G_S_side.T @ M_G
+
+        out['has_tag_pair'] = True
+        return out
+
     # ------------------------------------------------------------------ process_all
 
     def process_all(self, show_preview=False):
@@ -613,6 +1080,8 @@ class FinRayProcessor:
 
             purple_mask, green_mask = self.segment_gripper(image)
             combined_mask = cv2.bitwise_or(purple_mask, green_mask)
+            detections = self.detect_apriltags(image)
+            self._save_apriltag_debug_frame(image, detections)
 
             # Save background-zeroed (segmented) image for forces_for_free.py
             seg_img = image.copy()
@@ -620,6 +1089,22 @@ class FinRayProcessor:
             seg_filename = f"seg_{int(row.image_idx):06d}.jpg"
             seg_path = self.seg_dir / seg_filename
             cv2.imwrite(str(seg_path), seg_img)
+
+            rel_angle_deg = np.nan
+            rel_yaw_deg = np.nan
+            rel_pitch_deg = np.nan
+            rel_roll_deg = np.nan
+            det_g = detections.get(APRILTAG_GRIPPER_ID)
+            det_o = detections.get(APRILTAG_OBJECT_ID)
+            if det_g is not None and det_o is not None and 'R_C_tag' in det_g and 'R_C_tag' in det_o:
+                R_O_G = det_o['R_C_tag'].T @ det_g['R_C_tag']
+                tr = np.clip((np.trace(R_O_G) - 1.0) * 0.5, -1.0, 1.0)
+                rel_angle_deg = float(np.degrees(np.arccos(tr)))
+                rel_yaw_deg, rel_pitch_deg, rel_roll_deg = rotation_to_zyx_euler_deg(R_O_G)
+
+            wrench_R = self._transform_wrench_to_object(row, detections, 'R')
+            wrench_L = self._transform_wrench_to_object(row, detections, 'L')
+            self._save_force_surface_debug_frame(image, detections, wrench_R, wrench_L)
 
             if i % 10 == 0:
                 force_info = {}
@@ -634,7 +1119,23 @@ class FinRayProcessor:
                 self.save_visualization(image, purple_mask, green_mask, force_info, i)
 
             meta = {'image_idx': int(row.image_idx), 'time': float(row.time),
-                    'seg_path': str(seg_path)}
+                    'seg_path': str(seg_path),
+                    'tag0_detected': APRILTAG_GRIPPER_ID in detections,
+                    'tag1_detected': APRILTAG_OBJECT_ID in detections,
+                    'gripper_to_object_angle_deg': rel_angle_deg,
+                    'gripper_to_object_yaw_deg': rel_yaw_deg,
+                    'gripper_to_object_pitch_deg': rel_pitch_deg,
+                    'gripper_to_object_roll_deg': rel_roll_deg}
+
+            if det_g is not None and 'tvec' in det_g:
+                meta['tag0_tx_cam_m'] = float(det_g['tvec'][0])
+                meta['tag0_ty_cam_m'] = float(det_g['tvec'][1])
+                meta['tag0_tz_cam_m'] = float(det_g['tvec'][2])
+            if det_o is not None and 'tvec' in det_o:
+                meta['tag1_tx_cam_m'] = float(det_o['tvec'][0])
+                meta['tag1_ty_cam_m'] = float(det_o['tvec'][1])
+                meta['tag1_tz_cam_m'] = float(det_o['tvec'][2])
+
             for side in ['R', 'L']:
                 fx = getattr(row, f'force_x_{side}',  0.0)
                 fy = getattr(row, f'force_y_{side}',  0.0)
@@ -646,6 +1147,46 @@ class FinRayProcessor:
                 meta[f'ty_{side}']   = float(getattr(row, f'torque_y_{side}', 0.0))
                 meta[f'tz_{side}']   = float(getattr(row, f'torque_z_{side}', 0.0))
                 meta[f'fmag_{side}'] = float(np.sqrt(fx**2 + fy**2 + fz**2))
+
+            for side, wrench in [('R', wrench_R), ('L', wrench_L)]:
+                F_A   = wrench['force_applied_ati']
+                M_A   = wrench['torque_applied_ati']
+                F_O   = wrench['force_obj']
+                M_O   = wrench['torque_obj']
+                F_T   = wrench['force_tip_obj']
+                M_T   = wrench['torque_tip_obj']
+
+                meta[f'fx_applied_{side}_ati'] = float(F_A[0])
+                meta[f'fy_applied_{side}_ati'] = float(F_A[1])
+                meta[f'fz_applied_{side}_ati'] = float(F_A[2])
+                meta[f'tx_applied_{side}_ati'] = float(M_A[0])
+                meta[f'ty_applied_{side}_ati'] = float(M_A[1])
+                meta[f'tz_applied_{side}_ati'] = float(M_A[2])
+
+                meta[f'fx_{side}_obj'] = float(F_O[0])
+                meta[f'fy_{side}_obj'] = float(F_O[1])
+                meta[f'fz_{side}_obj'] = float(F_O[2])
+                meta[f'tx_{side}_obj'] = float(M_O[0])
+                meta[f'ty_{side}_obj'] = float(M_O[1])
+                meta[f'tz_{side}_obj'] = float(M_O[2])
+
+                meta[f'fx_tip_{side}_obj'] = float(F_T[0])
+                meta[f'fy_tip_{side}_obj'] = float(F_T[1])
+                meta[f'fz_tip_{side}_obj'] = float(F_T[2])
+                meta[f'tx_tip_{side}_obj'] = float(M_T[0])
+                meta[f'ty_tip_{side}_obj'] = float(M_T[1])
+                meta[f'tz_tip_{side}_obj'] = float(M_T[2])
+                meta[f'fmag_{side}_obj'] = float(np.linalg.norm(F_O))
+
+                F_S = wrench['force_surf']
+                M_S = wrench['torque_surf']
+                meta[f'fx_{side}_surf'] = float(F_S[0])
+                meta[f'fy_{side}_surf'] = float(F_S[1])
+                meta[f'fz_{side}_surf'] = float(F_S[2])
+                meta[f'tx_{side}_surf'] = float(M_S[0])
+                meta[f'ty_{side}_surf'] = float(M_S[1])
+                meta[f'tz_{side}_surf'] = float(M_S[2])
+
             metadata_rows.append(meta)
 
         df = pd.DataFrame(metadata_rows)
@@ -655,6 +1196,13 @@ class FinRayProcessor:
 
         print(f"\n  Processed {len(metadata_rows)} images")
         print(f"  Created ~{len(metadata_rows)//10} visualizations")
+        if len(df) > 0 and 'tag0_detected' in df.columns and 'tag1_detected' in df.columns:
+            n_pair = int((df['tag0_detected'] & df['tag1_detected']).sum())
+            print(f"  Frames with tag pair (0 & 1): {n_pair}/{len(df)}")
+        if self._debug_frame_saved:
+            print(f"  AprilTag debug image: {self.output_dir / APRILTAG_DEBUG_FRAME_NAME}")
+        if self._force_debug_saved:
+            print(f"  Force surface debug:  {self.output_dir / FORCE_DEBUG_FRAME_NAME}")
         print(f"  Output directory: {self.output_dir}")
         return df
 
@@ -725,6 +1273,7 @@ def main():
 
     # 2. Extract images
     processor.extract_images(bag_file)
+    processor.save_one_apriltag_debug_frame()
 
     # 3. ── HSV colour bounds ───────────────────────────────────────────────
     if USE_HSV_PICKER:

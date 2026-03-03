@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import pickle
 
 from utils.metrics_utils import calculate_grouped_rmse
-from utils.plot_utils import plot_pred_vs_actual
+from utils.plot_utils import plot_pred_vs_actual, plot_error_distributions
 from utils.io_utils import load_tabular_csv
 
 
@@ -22,7 +22,7 @@ if __name__ == "__main__":
     # --- 1. Load Pre-split Train/Validation/Test Data ---
     DATA_DIRECTORY = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\train_validation_test_data"
 
-    sensor_version = 4.6
+    sensor_version = 5.17
 
     # Files already created by the train_validation_test_dataset_generation.py script
     TRAIN_FILENAME = f"train_data_v{sensor_version}.csv"
@@ -163,15 +163,23 @@ if __name__ == "__main__":
     # Define save path in the current directory
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
     plot_save_path = os.path.join(SCRIPT_DIR, f'linear_regression_predictions_v{sensor_version}.png')
+    error_dist_save_path = os.path.join(SCRIPT_DIR, f'linear_regression_error_distribution_v{sensor_version}.png')
 
-    # Linear Regression historically used slightly larger subplots (5 wide x 5 tall each)
+    model_name = "Linear Regression"
+
     fig = plot_pred_vs_actual(
         y_test, predictions, OUTPUT_TARGETS,
-        save_path=plot_save_path,
-        figsize_factor=(5, 5),
+        title_suffix=model_name,
+        scatter_color='#292f56',
     )
+    fig.savefig(plot_save_path, bbox_inches='tight', dpi=300)
     plt.show()
-    plt.close(fig)
+    print(f"Prediction plot saved to: {plot_save_path}")
+
+    fig_err = plot_error_distributions(y_test, predictions, OUTPUT_TARGETS, title_suffix=model_name)
+    fig_err.savefig(error_dist_save_path, bbox_inches='tight', dpi=300)
+    plt.close(fig_err)
+    print(f"Error distribution plot saved to: {error_dist_save_path}")
 
     # --- 6. Save all Models and Scalers ---
     print("\n" + "="*70)

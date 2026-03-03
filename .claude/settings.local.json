@@ -3,7 +3,11 @@
     "allow": [
       "Bash(python:*)",
       "Bash(ls:*)",
-      "WebFetch(domain:ternaris.gitlab.io)"
+      "WebFetch(domain:ternaris.gitlab.io)",
+      "Bash(\"c:\\\\Thesis Harvard\\\\Thesis - Tactile Sensor\\\\TactileSensingMasterThesis\\\\Scripts\\\\python.exe\" -c \"import lightgbm; print\\(''lightgbm version:'', lightgbm.__version__\\)\")",
+      "Bash(python3 -c \":*)",
+      "Bash(\"c:\\\\Thesis Harvard\\\\Thesis - Tactile Sensor\\\\TactileSensingMasterThesis\\\\Scripts\\\\python.exe\" \"c:/Users/aurir/OneDrive/Desktop/Thesis- Biorobotics Lab/Thesis - Tactile Sensor/Barometers_Based_Tactile_Sensor/force_resolution_static_analysis.py\")",
+      "Bash(\"c:\\\\Thesis Harvard\\\\Thesis - Tactile Sensor\\\\TactileSensingMasterThesis\\\\Scripts\\\\python.exe\" -c \":*)"
     ]
   }
 }

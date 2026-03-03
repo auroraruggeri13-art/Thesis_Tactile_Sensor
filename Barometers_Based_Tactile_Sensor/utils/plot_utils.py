@@ -25,6 +25,7 @@ def plot_pred_vs_actual(
     alpha=0.5,
     s=20,
     scatter_color=None,
+    ideal_line_color="r",
     show_units=False,
     figsize_factor=(4, 4),
     title_fontsize=10,
@@ -46,6 +47,8 @@ def plot_pred_vs_actual(
         Scatter transparency and marker size.
     scatter_color : color spec or None
         Explicit scatter colour; None uses the matplotlib default cycle.
+    ideal_line_color : color spec
+        Colour for the dashed ideal y=x reference line.
     show_units : bool
         If True, append "mm" (for x, y) or "N" (for forces) to subplot titles.
     figsize_factor : (w, h)
@@ -81,7 +84,7 @@ def plot_pred_vs_actual(
             min_val - (max_val - min_val) * 0.05,
             max_val + (max_val - min_val) * 0.05,
         ]
-        ax.plot(lims, lims, "r--", alpha=0.75, linewidth=1.5)
+        ax.plot(lims, lims, linestyle="--", color=ideal_line_color, alpha=0.75, linewidth=1.5)
 
         mae = mean_absolute_error(true_vals, pred_vals)
         r2 = r2_score(true_vals, pred_vals)

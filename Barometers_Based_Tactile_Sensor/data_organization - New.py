@@ -47,7 +47,7 @@ from utils.barometer_processing import (
 # =========================== CONFIGURATION ===========================
 
 # Process multiple test numbers (single value or list)
-TEST_NUMS = [51092]  # Example: [51094, 51095, 51096]
+TEST_NUMS = [52001]  # Example: [51700, 51701, 51702, 51703, 51704, 51705]
 # [51000, 51001, 51002, 51003, 51004, 51005, 51006, 51007, 51008, 51100, 51101, 51102, 51103, 51104, 51105, 51106, 51200, 51201, 51202, 51203, 51204, 51205]
 # [51300, 51301, 51302, 51303, 51304, 51400, 51401, 51402, 51403, 51404, 51405, 51500, 51501, 51502, 51503]
 # [51030, 51031, 51032, 51033, 51034, 51035, 51036, 51130, 51131]
@@ -58,18 +58,18 @@ BASE_DIR = Path(r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test
 
 # --- Synchronization params ---
 ASOF_DIRECTION = "nearest"
-ASOF_TOLERANCE_S = 0.05  # seconds
+ASOF_TOLERANCE_S = 0.1  # seconds
 
 # --- Remove initial warm-up data ---
-REMOVE_INITIAL_WARMUP_DURATION = 1  # seconds to remove from the beginning (0 = disabled)
+REMOVE_INITIAL_WARMUP_DURATION = 0.2  # seconds to remove from the beginning (0 = disabled)
 
 # --- Step detection & leveling (removes hardware jumps before drift removal) ---
-ENABLE_STEP_LEVELING = True
+ENABLE_STEP_LEVELING = False
 STEP_THRESHOLD_HPA = 5.0   # Catches even small deviations
 STEP_WINDOW_SIZE = 200     # ~2 seconds at 100Hz
 
 # Outliers removal parameters
-ENABLE_OUTLIER_REMOVAL = True  # Enable/disable outlier removal
+ENABLE_OUTLIER_REMOVAL = False  # Enable/disable outlier removal
 threshold_multiplier = 30.0  # Number of standard deviations for outlier detection
 
 # --- Drift removal method selection ---
@@ -252,8 +252,7 @@ def apply_spatial_filter(df: pd.DataFrame) -> pd.DataFrame:
 # ============================== PLOTTING ===============================
 
 def plot_forces_torques_subplots(df, save_path=None, suptitle="ATI Force/Torque"):
-    """Plot all 6 force/torque channels in subplots."""
-    # Define colors: forces in green, torques in yellow
+    """Plot all 6 force/torque channels: forces in left column, torques in right column."""
     force_color = '#44b155'
     torque_color = '#d6c52e'
 
@@ -266,15 +265,43 @@ def plot_forces_torques_subplots(df, save_path=None, suptitle="ATI Force/Torque"
         return None
 
     fig, axes = plt.subplots(3, 2, figsize=(12, 10), sharex=True)
-    axes = axes.flatten()
-    for idx, (ax, (c, label)) in enumerate(zip(axes, cols)):
-        # Use green for forces (Fx, Fy, Fz), yellow for torques (Tx, Ty, Tz)
+    # Flatten column-major so Fx/Fy/Fz fill left column, Tx/Ty/Tz fill right column
+    axes_flat = axes.flatten(order='F')
+    for ax, (c, label) in zip(axes_flat, cols):
         color = force_color if label.startswith("F") else torque_color
         ax.plot(df["time"], df[c], linewidth=1.2, color=color)
         unit = "N" if label.startswith("F") else "N·m"
         ax.set_ylabel(f"{label} [{unit}]")
         ax.grid(alpha=0.3)
-    axes[min(len(cols), 6)-1].set_xlabel("Experiment Time [s]")
+    axes[2, 0].set_xlabel("Experiment Time [s]")
+    axes[2, 1].set_xlabel("Experiment Time [s]")
+    fig.suptitle(suptitle)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    if save_path:
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    return fig
+
+
+def plot_forces_only_subplots(df, save_path=None, suptitle="ATI Forces"):
+    """Plot Fx, Fy, Fz in a single column of 3 subplots."""
+    force_color = '#44b155'
+
+    cols = []
+    for base in ["Fx", "Fy", "Fz"]:
+        c = _force_name(df, base)
+        if c:
+            cols.append((c, base))
+    if not cols:
+        return None
+
+    fig, axes = plt.subplots(len(cols), 1, figsize=(8, 8), sharex=True)
+    if len(cols) == 1:
+        axes = [axes]
+    for ax, (c, label) in zip(axes, cols):
+        ax.plot(df["time"], df[c], linewidth=1.2, color=force_color)
+        ax.set_ylabel(f"{label} [N]")
+        ax.grid(alpha=0.3)
+    axes[-1].set_xlabel("Experiment Time [s]")
     fig.suptitle(suptitle)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     if save_path:
@@ -427,6 +454,7 @@ def process_single_test(TEST_NUM):
     plot_barometers_subplots(merged, save_path=save_plots_dir / "4_barometers_final.png", suptitle="Barometers (final processed)")
 
     plot_forces_torques_subplots(merged, save_path=save_plots_dir / "ati_forces_torques.png")
+    plot_forces_only_subplots(merged, save_path=save_plots_dir / "ati_forces_only.png")
     plot_barometers_vs_fz(merged, save_path=save_plots_dir / "barometers_vs_Fz.png")
     plot_barometers_vs_fx(merged, save_path=save_plots_dir / "barometers_vs_Fx.png")
     plot_barometers_vs_fy(merged, save_path=save_plots_dir / "barometers_vs_Fy.png")

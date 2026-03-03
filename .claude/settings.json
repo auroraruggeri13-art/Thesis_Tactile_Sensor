@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/aurir/OneDrive - epfl.ch/Thesis- Biorobotics Lab/models parameters/averaged models/**)",
+      "Bash(python3 -c \":*)",
+      "Read(//c/Users/aurir/OneDrive - epfl.ch/Thesis- Biorobotics Lab/Sensor Characterization/repeatability_hysteresis/**)",
+      "Bash(dir \"C:\\\\Users\\\\aurir\\\\OneDrive - epfl.ch\\\\Thesis- Biorobotics Lab\\\\Sensor Characterization\\\\repeatability_hysteresis\"\")",
+      "Read(//c/Users/aurir/OneDrive - epfl.ch/Thesis- Biorobotics Lab/train_validation_test_data/**)",
+      "Read(//c/Users/aurir/.claude/projects/c--Users-aurir-OneDrive-Desktop-Thesis--Biorobotics-Lab-Thesis---Tactile-Sensor/7dee41ee-eefd-482e-84dd-91284429311a/tool-results/**)",
+      "Read(//c/Users/aurir/OneDrive - epfl.ch/Thesis- Biorobotics Lab/test data/test 51819002 - sensor v5/output 2>/dev/**)",
+      "Read(//c/Users/aurir/OneDrive - epfl.ch/Thesis- Biorobotics Lab/test data/test 51819002 - sensor v5/**)",
+      "Read(//c/Users/aurir/OneDrive - epfl.ch/Thesis- Biorobotics Lab/test data/**)"
+    ]
+  }
+}

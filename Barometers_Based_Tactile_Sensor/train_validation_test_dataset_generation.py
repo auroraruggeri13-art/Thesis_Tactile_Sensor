@@ -9,17 +9,46 @@ import numpy as np
 # ================== CONFIG ==================
 # Base directory that contains all test folders
 DATA_DIRECTORY = Path(r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data")
-VERSION_NUM = 5.1092
+VERSION_NUM = 5.20
 
 # Fractions must sum to 1.0
-TRAIN_FRAC = 1
-VAL_FRAC   = 0.0
-TEST_FRAC  = 0.0
+TRAIN_FRAC = 0.75
+VAL_FRAC   = 0.15
+TEST_FRAC  = 0.15
 
 # Relative CSV paths inside DATA_DIRECTORY
 CSV_FILENAMES = [
     
-    r"test 51092 - sensor v5\synchronized_events_51092.csv",
+    # r"test 51791 - sensor v5\synchronized_events_51791.csv",
+    # r"test 51792 - sensor v5\synchronized_events_51792.csv",
+    # r"test 51793 - sensor v5\synchronized_events_51793.csv",
+    
+    # r"test 51795 - sensor v5\synchronized_events_51795.csv",
+    
+    r"test 52000 - sensor v5\synchronized_events_52000.csv",
+    r"test 52001 - sensor v5\synchronized_events_52001.csv",
+    
+    # r"test 51700 - sensor v5\synchronized_events_51700.csv",
+    # r"test 51701 - sensor v5\synchronized_events_51701.csv",
+    # r"test 51702 - sensor v5\synchronized_events_51702.csv",
+    # r"test 51704 - sensor v5\synchronized_events_51704.csv",
+    # r"test 51705 - sensor v5\synchronized_events_51705.csv",
+    # # r"test 51706 - sensor v5\synchronized_events_51706.csv",
+    # # r"test 51707 - sensor v5\synchronized_events_51707.csv",
+    # # r"test 51708 - sensor v5\synchronized_events_51708.csv",    
+    # # r"test 51709 - sensor v5\synchronized_events_51709.csv",
+    # # r"test 51710 - sensor v5\synchronized_events_51710.csv",
+    
+    # r"test 51800 - sensor v5\synchronized_events_51800.csv",
+    # r"test 51801 - sensor v5\synchronized_events_51801.csv",
+    # r"test 51802 - sensor v5\synchronized_events_51802.csv",
+    # r"test 51803 - sensor v5\synchronized_events_51803.csv",
+    # # r"test 51804 - sensor v5\synchronized_events_51804.csv",
+
+    # r"test 51900 - sensor v5\synchronized_events_51900.csv",
+    # r"test 51901 - sensor v5\synchronized_events_51901.csv",
+    # r"test 51902 - sensor v5\synchronized_events_51902.csv",
+    # r"test 51903 - sensor v5\synchronized_events_51903.csv",
     
     # r"test 2 - sensor v5\synchronized_events_2.csv",
     # r"test 3 - sensor v5\synchronized_events_3.csv",    
