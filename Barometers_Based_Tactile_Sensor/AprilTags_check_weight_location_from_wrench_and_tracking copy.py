@@ -42,14 +42,14 @@ from matplotlib.patches import Rectangle
 from scipy import signal
 
 sys.path.insert(0, str(Path(__file__).parent))
-from utils.sensor_io import load_ati_data, load_atracsys_data, asof_join
+from utils.sensor_io import load_ati_data, asof_join
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 1 — TRIAL / PATH SETTINGS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-TEST_NUM    = 52001
+TEST_NUM    = 52092
 VERSION_NUM = 5
 BOX_TAG_ID  = 1          # marker_id of the fixed box AprilTag (tag1)
 
@@ -57,7 +57,8 @@ DATASET_DIR = os.path.abspath(
     fr"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data"
     fr"\test {TEST_NUM} - sensor v{VERSION_NUM}"
 )
-ATRACSYS_FILE = f"atracsys_trial{TEST_NUM}.txt"
+TAG1_FILE     = f"{TEST_NUM}tag1_pose_trial.txt"   # box tag (fixed)
+TAG2_FILE     = f"{TEST_NUM}tag2_pose_trial.txt"   # probe tag (moving)
 ATI_FILE      = f"{TEST_NUM}ati_middle_trial.txt"
 
 PAIR_TOL_S    = 0.020    # max time gap [s] for sensor synchronisation
@@ -75,12 +76,12 @@ Z_LIMIT_MM_2D = 10.0     # Z-depth filter for 2-D surface plots [mm]
 # The Top frame origin is offset from the Box tag origin by d_T_in_B,
 # expressed in Box frame axes.  Orientation is parallel (R_B_T = I).
 
-X_SHIFT = 15 / 1000    # m — Top origin along Box X
-Y_SHIFT = 64 / 1000    # m — Top origin along Box Y
-Z_SHIFT = 115 / 1000    # m — Top origin along Box Z  (height of box surface)
+X_SHIFT = -5 / 1000    # m — Top origin along Box X
+Y_SHIFT = 70 / 1000    # m — Top origin along Box Y
+Z_SHIFT = 120 / 1000    # m — Top origin along Box Z  (height of box surface)
 
 CORRECT_INPLANE_ROTATION  = True
-MANUAL_ROTATION_ANGLE_DEG = 6         # degrees; None → auto (PCA)
+MANUAL_ROTATION_ANGLE_DEG = 3         # degrees; None → auto (PCA)
 
 R_B_T = np.eye(3, dtype=float)   # Top axes aligned with Box axes
 
@@ -202,6 +203,63 @@ def stabilize_box_orientation(R_C_B: np.ndarray) -> np.ndarray:
     R_fixed = quat_to_rotm(q_mean)
     print(f"Box orientation stabilised using mean of {N} frames.")
     return np.broadcast_to(R_fixed, R_C_B.shape).copy()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4b — TAG FILE LOADER  (replaces Atracsys intermediate file)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _time_to_seconds(t_raw: np.ndarray) -> np.ndarray:
+    """Heuristic: ns/us/ms → seconds based on magnitude."""
+    t = np.asarray(t_raw, dtype=np.float64)
+    med = np.nanmedian(np.abs(t))
+    if med > 1e12:   return t * 1e-9   # nanoseconds
+    elif med > 1e9:  return t * 1e-6   # microseconds
+    elif med > 1e6:  return t * 1e-3   # milliseconds
+    return t
+
+
+def _quat_xyzw_to_rotm(qx, qy, qz, qw) -> np.ndarray:
+    """Vectorized quaternion (x,y,z,w) → rotation matrix (N,3,3).
+    Convention: R_C_tag — maps tag-frame vectors into camera frame."""
+    x = np.asarray(qx, float); y = np.asarray(qy, float)
+    z = np.asarray(qz, float); w = np.asarray(qw, float)
+    n = np.sqrt(x*x + y*y + z*z + w*w); n[n == 0] = 1.0
+    x /= n; y /= n; z /= n; w /= n
+    xx, yy, zz = x*x, y*y, z*z
+    xy, xz, yz = x*y, x*z, y*z
+    xw, yw, zw = x*w, y*w, z*w
+    R = np.empty((len(x), 3, 3), dtype=np.float64)
+    R[:,0,0] = 1-2*(yy+zz);  R[:,0,1] = 2*(xy-zw);   R[:,0,2] = 2*(xz+yw)
+    R[:,1,0] = 2*(xy+zw);    R[:,1,1] = 1-2*(xx+zz);  R[:,1,2] = 2*(yz-xw)
+    R[:,2,0] = 2*(xz-yw);    R[:,2,1] = 2*(yz+xw);    R[:,2,2] = 1-2*(xx+yy)
+    return R
+
+
+def load_tag_file(path: str, tag_id: int) -> pd.DataFrame:
+    """Load a ROS AprilTag pose CSV directly.
+
+    Expected columns: %time, field.pose.position.{x,y,z},
+                      field.pose.orientation.{x,y,z,w}
+    Positions are in metres (ROS convention).
+
+    Returns DataFrame compatible with asof_join():
+      t, marker_id, px, py, pz, R
+    """
+    df = pd.read_csv(path)
+    t_s = _time_to_seconds(df["%time"].astype(np.int64).to_numpy())
+    px  = df["field.pose.position.x"].astype(float).to_numpy()
+    py  = df["field.pose.position.y"].astype(float).to_numpy()
+    pz  = df["field.pose.position.z"].astype(float).to_numpy()
+    qx  = df["field.pose.orientation.x"].astype(float).to_numpy()
+    qy  = df["field.pose.orientation.y"].astype(float).to_numpy()
+    qz  = df["field.pose.orientation.z"].astype(float).to_numpy()
+    qw  = df["field.pose.orientation.w"].astype(float).to_numpy()
+    R   = _quat_xyzw_to_rotm(qx, qy, qz, qw)
+    out = pd.DataFrame({"t": t_s, "marker_id": int(tag_id),
+                        "px": px, "py": py, "pz": pz})
+    out["R"] = list(R)
+    return out.sort_values("t").reset_index(drop=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -429,18 +487,18 @@ def plot_coordinate_systems(out_dir, pP_C, pB_C, tip_C,
 # 8 — MAIN PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def main(atracsys_path: str, test_num: int):
-    base_dir = os.path.dirname(os.path.abspath(atracsys_path))
+def main(test_num: int):
+    base_dir = DATASET_DIR
     out_dir  = os.path.join(base_dir, f"lin{test_num}")
     os.makedirs(out_dir,    exist_ok=True)
     os.makedirs(DATASET_DIR, exist_ok=True)
     print(f"Trial {test_num}  |  Smoothing: {SMOOTH_METHOD}")
 
     # ── Step 1: Load raw data ─────────────────────────────────────────────────
-    ati_data = load_ati_data(os.path.join(base_dir, ATI_FILE))
-    df_tags  = load_atracsys_data(atracsys_path)
-    probe_df, box_df, probe_id = split_probe_and_box(df_tags, box_id=BOX_TAG_ID)
-    print(f"  Box tag = {BOX_TAG_ID}  |  Probe tag = {probe_id}")
+    ati_data  = load_ati_data(os.path.join(base_dir, ATI_FILE))
+    box_df    = load_tag_file(os.path.join(base_dir, TAG1_FILE), tag_id=1)   # fixed box
+    probe_df  = load_tag_file(os.path.join(base_dir, TAG2_FILE), tag_id=2)   # moving probe
+    print(f"  Box tag = tag1 ({len(box_df)} frames)  |  Probe tag = tag2 ({len(probe_df)} frames)")
     F  = asof_join(probe_df, box_df, PAIR_TOL_S)
     tt = F["t"].to_numpy()
 
@@ -618,7 +676,6 @@ def main(atracsys_path: str, test_num: int):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--atracsys", type=str, default=None)
-    parser.add_argument("--test",     type=int, default=TEST_NUM)
+    parser.add_argument("--test", type=int, default=TEST_NUM)
     args = parser.parse_args()
-    main(args.atracsys or os.path.join(DATASET_DIR, ATRACSYS_FILE), args.test)
+    main(args.test)

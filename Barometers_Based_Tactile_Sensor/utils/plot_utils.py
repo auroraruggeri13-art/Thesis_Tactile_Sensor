@@ -89,17 +89,12 @@ def plot_pred_vs_actual(
         mae = mean_absolute_error(true_vals, pred_vals)
         r2 = r2_score(true_vals, pred_vals)
 
-        if show_units:
-            unit = "mm" if col in ["x", "y"] else "N"
-            ax.set_title(
-                f"{col}\nMAE: {mae:.2f} {unit} | R\u00b2: {r2:.3f}",
-                fontsize=title_fontsize,
-            )
-        else:
-            ax.set_title(
-                f"{col}\nMAE: {mae:.2f} | R\u00b2: {r2:.3f}",
-                fontsize=title_fontsize,
-            )
+        unit = "mm" if col in ["x", "y"] else "N"
+        display_col = col.capitalize() if col not in ["x", "y"] else col
+        ax.set_title(
+            f"{display_col} ({unit})\nMAE: {mae:.2f} {unit} | R\u00b2: {r2:.3f}",
+            fontsize=title_fontsize,
+        )
 
         ax.set_xlabel("Actual", fontsize=xlabel_fontsize)
         ax.set_ylabel("Predicted", fontsize=ylabel_fontsize)

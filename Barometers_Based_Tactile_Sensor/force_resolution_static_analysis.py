@@ -36,7 +36,7 @@ COLORS = ["#292f56", "#005c7f", "#008780", "#44b155", "#d6c52e", "#3a7a9e"]
 # ============================================================
 # ======================= USER CONFIG ========================
 # ============================================================
-SENSOR_VERSION = 5.18
+SENSOR_VERSION = 5.2092
 
 # Quasi-static data for Method A (train_data_v5.1892 = 2 force ramps, very quasi-static)
 RAW_DATA_DIR = Path(r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\train_validation_test_data")
@@ -44,14 +44,14 @@ RAW_CSV_FILES = [
     r"train_data_v5.1893.csv",
 ]
 
-# LightGBM model v5.180
+# LightGBM model v5.200
 LGBM_MODEL_DIR  = Path(r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\models parameters\averaged models")
-LGBM_MODEL_FILE = "lightgbm_sliding_window_model_v5.180.pkl"
-LGBM_SCALER_FILE = "scaler_sliding_window_v5.180.pkl"
+LGBM_MODEL_FILE = "lightgbm_sliding_window_model_v5.200.pkl"
+LGBM_SCALER_FILE = "scaler_sliding_window_v5.200.pkl"
 
 # Model hyperparameters (must match training)
 LGBM_WINDOW_SIZE       = 10      # past samples per window
-LGBM_USE_2ND_DERIV     = True    # v5.180 trained with 2nd derivatives → 198 features
+LGBM_USE_2ND_DERIV     = True    # v5.200 trained with 2nd derivatives → 198 features
 LGBM_APPLY_DENOISING   = True    # rolling-mean smoothing on barometers
 LGBM_DENOISE_WINDOW    = 5       # denoising window (samples)
 LGBM_MAX_TIME_GAP      = 0.05    # skip windows spanning gaps > this (seconds)

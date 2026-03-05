@@ -39,7 +39,7 @@ from hsv_color_picker import pick_hsv_bounds, patch_processor
 
 # =========================== CONFIGURATION ===========================
 
-test_num = 51819003
+test_num = 52021006
 # Geometric offsets in object-tag frame O (tag id=1)
 TIP_OFFSET_FROM_ATI_M      = 15/1000   # +15 mm along Z_A (external direction)
 

@@ -9,7 +9,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from utils.io_utils import load_tabular_csv
 
 BASE = Path(r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab")
-DATA = BASE / "train_validation_test_data" / "train_data_v5.1894.csv"
+
+model_number = 180
+train_set = 1894
+DATA = BASE / "train_validation_test_data" / f"train_data_v5.{train_set}.csv"
 MDIR = BASE / "models parameters" / "averaged models"
 OUT  = BASE / "Sensor Characterization" / "repeatability_hysteresis"
 
@@ -27,7 +30,7 @@ raw_gt = np.abs(raw["fz"].values)
 print(f"File: {len(raw)} rows, t={raw_t[-1]:.1f}s, max|Fz|={raw_gt.max():.2f}N")
 
 # Cut at 8 s
-_cut = raw_t <= 8.0
+_cut = raw_t <= 30.0
 raw_t  = raw_t[_cut]
 raw_gt = raw_gt[_cut]
 
@@ -58,23 +61,23 @@ for i in range(W, len(df)):
 X   = np.array(X_lst)
 adf = df.iloc[idx_lst].reset_index(drop=True)
 
-with open(MDIR / "lightgbm_sliding_window_model_v5.180.pkl", "rb") as f:
+with open(MDIR / f"lightgbm_sliding_window_model_v5.{model_number}.pkl", "rb") as f:
     models = pickle.load(f)
-with open(MDIR / "scaler_sliding_window_v5.180.pkl", "rb") as f:
+with open(MDIR / f"scaler_sliding_window_v5.{model_number}.pkl", "rb") as f:
     scaler = pickle.load(f)
 
 pred_t  = adf["t"].values - t0
 pred_fz = np.abs(models[4].predict(scaler.transform(X)))
 print(f"Predictions: {len(pred_fz)} windows, max pred={pred_fz.max():.2f}N")
 
-MA_WIN       = 21
+MA_WIN       = 11
 TIME_SHIFT_S = -0.00   # seconds — shift predictions forward (+) or backward (-)
 
 pred_fz_sm = np.convolve(pred_fz, np.ones(MA_WIN) / MA_WIN, mode="same")
 
 pred_t = pred_t + TIME_SHIFT_S   # manual time shift
 
-_cut_p = pred_t <= 8.0
+_cut_p = pred_t <= 30.0
 pred_t     = pred_t[_cut_p]
 pred_fz_sm = pred_fz_sm[_cut_p]
 
@@ -84,7 +87,7 @@ ax.plot(raw_t,  raw_gt,  color="#292f56", lw=2.0, label="GT $|F_z|$")
 ax.plot(pred_t, pred_fz_sm, color="#008780", lw=1.2, alpha=0.85, label="Pred $|F_z|$")
 ax.set_xlabel("Time [s]", fontsize=12)
 ax.set_ylabel("$|F_z|$ [N]", fontsize=12)
-ax.set_title("train_data_v5.1894 — GT vs Predicted $|F_z|$", fontsize=11)
+ax.set_title(f"train_data_v5.{train_set} — GT vs Predicted $|F_z|$", fontsize=11)
 ax.legend(fontsize=11)
 ax.grid(True, alpha=0.3)
 ax.set_ylim(bottom=0)
@@ -98,13 +101,15 @@ print("Saved: hysteresis_timeseries.png")
 from scipy.signal import find_peaks
 
 pred_on_raw = np.interp(raw_t, pred_t, pred_fz_sm)
-PALETTE = ["#292f56", "#008780", "#44b155"]   # navy, teal, green — codebase palette
 THRESH  = 0.15
 lim = max(raw_gt.max(), pred_on_raw.max()) * 1.05
 
 gt_peaks, _ = find_peaks(raw_gt, height=0.5, distance=20)
-gt_peaks = gt_peaks[:3]   # keep only first 3 cycles
-print(f"GT peaks: {len(gt_peaks)}")
+n_cycles = len(gt_peaks)
+print(f"GT peaks: {n_cycles}")
+
+cmap = plt.get_cmap("tab10")
+PALETTE = [cmap(i % 10) for i in range(n_cycles)]
 
 fig2, ax = plt.subplots(figsize=(7, 6))
 for i, pk in enumerate(gt_peaks):
@@ -120,7 +125,7 @@ for i, pk in enumerate(gt_peaks):
 ax.plot([0, lim], [0, lim], color="gray", lw=1.0, ls="--", label="Ideal (y = x)")
 ax.set_xlabel("GT $|F_z|$ [N]", fontsize=12)
 ax.set_ylabel("Pred $|F_z|$ [N]", fontsize=12)
-ax.set_title("train_data_v5.1894 — GT vs Pred $|F_z|$", fontsize=11)
+ax.set_title(f"train_data_v5.{train_set} — GT vs Pred $|F_z|$", fontsize=11)
 ax.legend(fontsize=11)
 ax.grid(True, alpha=0.3)
 ax.set_xlim(left=0); ax.set_ylim(bottom=0)

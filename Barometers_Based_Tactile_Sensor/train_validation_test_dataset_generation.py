@@ -9,10 +9,10 @@ import numpy as np
 # ================== CONFIG ==================
 # Base directory that contains all test folders
 DATA_DIRECTORY = Path(r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data")
-VERSION_NUM = 5.20
+VERSION_NUM = 5.2092
 
 # Fractions must sum to 1.0
-TRAIN_FRAC = 0.75
+TRAIN_FRAC = 0.70
 VAL_FRAC   = 0.15
 TEST_FRAC  = 0.15
 
@@ -23,10 +23,23 @@ CSV_FILENAMES = [
     # r"test 51792 - sensor v5\synchronized_events_51792.csv",
     # r"test 51793 - sensor v5\synchronized_events_51793.csv",
     
+    r"test 52092 - sensor v5\synchronized_events_52092.csv",
+    
     # r"test 51795 - sensor v5\synchronized_events_51795.csv",
     
-    r"test 52000 - sensor v5\synchronized_events_52000.csv",
-    r"test 52001 - sensor v5\synchronized_events_52001.csv",
+    # r"test 52000 - sensor v5\synchronized_events_52000.csv",
+    # r"test 52001 - sensor v5\synchronized_events_52001.csv",
+    # r"test 52002 - sensor v5\synchronized_events_52002.csv",
+    # r"test 52003 - sensor v5\synchronized_events_52003.csv",
+    # r"test 52004 - sensor v5\synchronized_events_52004.csv",   
+    # r"test 52005 - sensor v5\synchronized_events_52005.csv",
+    # r"test 52006 - sensor v5\synchronized_events_52006.csv",
+    
+    # r"test 52100 - sensor v5\synchronized_events_52100.csv",
+    # # r"test 52101 - sensor v5\synchronized_events_52101.csv",
+    # # r"test 52102 - sensor v5\synchronized_events_52102.csv",
+    
+    # ## r"test 52200 - sensor v5\synchronized_events_52200.csv", # molto male
     
     # r"test 51700 - sensor v5\synchronized_events_51700.csv",
     # r"test 51701 - sensor v5\synchronized_events_51701.csv",
