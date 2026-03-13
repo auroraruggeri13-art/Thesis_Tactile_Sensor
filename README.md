@@ -1,374 +1,447 @@
 # Tactile Sensor — Master Thesis
 
-This repository contains all code for a master thesis on **barometer-based tactile sensing**. The project is split into two main parts, both aimed at predicting contact forces — with the goal of comparing the two approaches against a ground-truth force/torque sensor (ATI).
+A research project on **barometer-based and vision-based tactile sensing** for robotic contact-force estimation. The sensor embeds 6 DPS310 barometric pressure sensors in a silicone pad; ML models map barometer readings (or visual deformation) to 3-axis contact forces validated against an ATI F/T sensor.
+
+---
+
+## Table of Contents
+
+- [Project Overview](#project-overview)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Project Structure](#project-structure)
+- [Pipeline 1 — Barometer-Based Force Estimation](#pipeline-1--barometer-based-force-estimation)
+- [Pipeline 2 — Vision-Based Force Estimation](#pipeline-2--vision-based-force-estimation)
+- [Configuration & Hard-Coded Paths](#configuration--hard-coded-paths)
+- [Data Organization](#data-organization)
+- [Hardware Setup](#hardware-setup)
+- [Model Comparison](#model-comparison)
+- [Troubleshooting](#troubleshooting)
+- [Utilities Reference](#utilities-reference)
 
 ---
 
 ## Project Overview
 
-### Part 1 — Barometer-Based Tactile Sensor (`Barometers_Based_Tactile_Sensor/`)
-
-A soft tactile sensor embedding **6 barometric pressure sensors (DPS310)** in a silicone pad. When a contact force is applied, the silicone deforms and the internal pressure changes. Machine learning models are trained to map those barometer readings to the 3-axis contact forces (Fx, Fy, Fz).
-
-**Pipeline:**
-1. Collect raw data: AprilTag-based 3D pose tracking + ATI force/torque sensor + Arduino barometer array
-2. Extract and align tip pose and forces from AprilTag detections and ATI logs
-3. Synchronize barometer readings with force/pose into a clean per-test dataset
-4. Aggregate multiple tests into train/validation/test splits
-5. Train and evaluate multiple ML models (linear regression, Random Forest, XGBoost, LightGBM, MLP, LSTM, 1D CNN)
-6. Deploy the best model for real-time inference at 200–500+ Hz
-
-### Part 2 — Vision-Based Force Estimation (`Vision_vs_Tactile/`)
-
-An alternative approach that estimates contact forces **from visual deformation** of the sensor surface. A camera observes the silicone pad; the displacement/deformation of the surface (tracked via color or marker features) is used to predict applied forces.
-
-**Pipeline:**
-1. Extract image frames and barometer readings from a ROS bag file
-2. Detect and track the deformation region using HSV color segmentation
-3. Estimate forces from the deformation (color blob area, centroid shift, or displacement magnitude)
-
-### Comparison Goal
-
-Both approaches — **barometer-based** (Part 1) and **vision-based** (Part 2) — produce force estimates that are compared against the **ATI force/torque sensor** ground truth. This enables a quantitative evaluation of:
-- Prediction accuracy (RMSE per axis)
-- Temporal response and latency
-- Robustness and practical deployment constraints
+| Aspect | Detail |
+|--------|--------|
+| **Sensor** | 6× DPS310 barometers embedded in silicone pad |
+| **Sampling rate** | 125 Hz (Arduino MKR Zero) |
+| **Prediction targets** | Contact position (x, y) + 3-axis forces (Fx, Fy, Fz) |
+| **Best model** | LightGBM with sliding-window features (200–500+ Hz inference) |
+| **Ground truth** | ATI Industrial F/T sensor |
+| **Tracking** | AprilTag or Atracsys optical tracking |
 
 ---
 
-## Repository Structure
+## Prerequisites
+
+### Software
+
+- **Python 3.10 or 3.11** — Python 3.12+ has TensorFlow compatibility issues
+- **pip** — `python -m pip install --upgrade pip`
+- *(Optional)* Arduino IDE 2.x — for flashing firmware
+
+### Hardware *(only needed for data collection)*
+
+- Arduino MKR Zero + 6× DPS310 pressure sensors (I2C)
+- ATI F/T sensor (ground truth)
+- AprilTag camera rig or Atracsys optical tracker
+
+### For the Real-Time Demo
+
+No ROS required. `realtime_demo.py` works standalone with just the Arduino connected.
+
+---
+
+## Installation
+
+```bash
+# 1. Clone the repository
+git clone <repository-url>
+cd "Thesis - Tactile Sensor"
+
+# 2. Create a virtual environment
+python -m venv TactileSensingMasterThesis
+
+# 3. Activate it
+#    Windows (PowerShell):
+TactileSensingMasterThesis\Scripts\Activate.ps1
+#    macOS / Linux:
+source TactileSensingMasterThesis/bin/activate
+
+# 4. Install dependencies
+pip install --upgrade pip
+pip install -r requirements.txt
+
+# 5. Verify
+python -c "import pandas, numpy, lightgbm, torch; print('All core imports OK')"
+```
+
+> **GPU acceleration:** Install CUDA 11.8+ and cuDNN, then reinstall `torch` and `tensorflow` with their GPU-enabled variants (see official docs). Without GPU, all scripts fall back to CPU.
+
+---
+
+## Project Structure
 
 ```
 Thesis - Tactile Sensor/
 │
-├── Barometers_Based_Tactile_Sensor/       # Part 1: barometer-based pipeline
-│   ├── utils/                             # Shared utility modules
-│   ├── check_weight_location_from_wrench_and_tracking.py
-│   ├── data_organization - New.py
-│   ├── train_validation_test_dataset_generation.py
-│   ├── barometers_plot.py
-│   ├── hysteresis_material_testing.py
-│   ├── COMSOL_pressure_analysis.py
-│   ├── Sensor1_Repeteability.py
+├── config.py                                         <- Centralized paths & constants
+├── realtime_demo.py                                  <- EASIEST ENTRY POINT (no ROS)
+├── requirements.txt
+├── README.md
+├── PIPELINE.md                                       <- Step-by-step execution guide
+│
+├── Barometers_Based_Tactile_Sensor/                  <- Part 1: barometer pipeline
+│   ├── utils/
+│   │   ├── barometer_processing.py                   # Signal processing
+│   │   ├── sensor_io.py                              # Load ATI / tracking logs
+│   │   ├── signal_utils.py                           # Derivatives, denoising
+│   │   ├── metrics_utils.py                          # RMSE, grouped metrics
+│   │   ├── plot_utils.py                             # Visualization helpers
+│   │   └── io_utils.py                               # File I/O helpers
+│   │
+│   ├── Pose_Forces_Synchronized_with_Baro_Processing.py  # Steps 2-3
+│   ├── train_validation_test_dataset_generation.py        # Step 4
+│   ├── LightGBM_sliding_window_predictions.py             # Step 5 (recommended)
 │   ├── Linear_Regression_force_predictions.py
 │   ├── random_forest_force_prediction.py
-│   ├── XGBoost_force_prediction.py
 │   ├── NN_force_prediction.py
 │   ├── LSTM.py
 │   ├── 1D_CNN_prediction.py
-│   ├── RF_or_XGB_sliding_window_predictions.py
-│   ├── realtime_tactile_prediction.py
-│   └── sensor_characterization_plots.ipynb
+│   ├── transformer_sliding_window_predictions.py
+│   └── realtime_tactile_prediction.py                     # Advanced real-time module
 │
-├── Vision_vs_Tactile/                     # Part 2: vision-based force estimation
-│   ├── utils/
-│   ├── direct_jpeg_extractor.py           # Extract frames from ROS bag + sync barometers
-│   ├── forces_for_free.py                 # Estimate forces from visual deformation
-│   └── hsv_color_picker.py               # Interactive HSV color range selector
+├── Vision_vs_Tactile/                                <- Part 2: vision pipeline
+│   ├── direct_jpeg_extractor.py                      # Extract frames from ROS bag
+│   ├── plot_models_predictions_from_csv.py
+│   └── Codes_for_cluster/                            # HPC versions
+│       ├── code/forces_for_free.py
+│       └── Tactile_sensor_model/train_lightgbm.py
 │
 ├── Arduino Codes & Barometers Logging & AprilTags Scripts/
-│   ├── TactileSensorArduinoCode/
-│   │   └── TactileSensorCode.ino          # Firmware: 6x DPS310 barometers at 125 Hz
-│   ├── single_sensor_hysteresis_testing_Arduino/
-│   │   └── adafruit_single_sensor.ino
-│   ├── baro_serial_node.py                # ROS node for Arduino barometer logging
-│   └── tagposes_from_detections.py        # Compute tip poses from AprilTag detections
+│   ├── TactileSensorArduinoCode/TactileSensorCode.ino
+│   ├── baro_serial_node.py
+│   └── tagposes_from_detections.py
 │
-├── realtime_demo.py                       # Minimal real-time demo (no ROS required)
-├── sensor_characterization.ipynb
-├── requirements.txt
-└── README.md
+├── predictions_with_temperature/                     <- Temperature-aware variant
+├── CAD_files/                                        <- Fusion360 + STL files
+└── TactileSensingMasterThesis/                       <- Local venv (git-ignored)
 ```
 
 ---
 
-## Getting Started on a New Machine
+## Pipeline 1 — Barometer-Based Force Estimation
 
-Follow these steps in order to get the project running on a fresh laptop.
+> See [PIPELINE.md](PIPELINE.md) for a concise numbered execution checklist.
 
-### 1. Clone the repository
+### Step 1 — Collect Raw Data
+
+Connect the Arduino MKR Zero and start logging. See [Hardware Setup](#hardware-setup).
+
+**Files produced per test session:**
+```
+test data/test <N> - sensor v<V>/
+├── apriltag_detections_trial<N>.txt    # 3D tip pose from AprilTag
+├── ati_middle_trial<N>.txt             # ATI force/torque log
+└── barometers_trial<N>.txt             # Arduino 6-channel barometer CSV
+```
+
+### Step 2–3 — Synchronize Barometers with Forces
+
+**Script:** `Barometers_Based_Tactile_Sensor/Pose_Forces_Synchronized_with_Baro_Processing.py`
+
+Edit the `TEST_NUMS` list at the top, then run:
 
 ```bash
-git clone <repo-url>
-cd "Thesis - Tactile Sensor"
+python Barometers_Based_Tactile_Sensor/Pose_Forces_Synchronized_with_Baro_Processing.py
 ```
 
-### 2. Install Python
+What it does:
+- Removes 2 s warmup; applies EMA drift correction
+- Transforms AprilTag detections to tip position in sensor frame
+- Time-aligns barometers + ATI via `merge_asof` (50 ms tolerance)
+- Applies spatial mask (contacts inside sensor area only)
+- MAD-based outlier removal
 
-Make sure you have **Python 3.10 or 3.11** installed (3.12+ may have compatibility issues with TensorFlow).
-Download from [python.org](https://www.python.org/downloads/) and check "Add Python to PATH" during installation.
+**Output:** `synchronized_events_<N>.csv` in each test folder + diagnostic plots
 
-Verify:
-```
-python --version
-```
+### Step 4 — Build Train / Validation / Test Splits
 
-### 3. Create and activate a virtual environment
+**Script:** `Barometers_Based_Tactile_Sensor/train_validation_test_dataset_generation.py`
 
-```powershell
-python -m venv TactileSensingMasterThesis
-TactileSensingMasterThesis\Scripts\Activate.ps1
-```
+Edit `CSV_FILENAMES` to list your synchronized CSVs, then:
 
-If PowerShell blocks the activation script:
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```bash
+python Barometers_Based_Tactile_Sensor/train_validation_test_dataset_generation.py
 ```
 
-Then activate again.
-
-### 4. Install dependencies
-
+**Output:**
 ```
-pip install -r requirements.txt
-```
-
-This installs all required packages (pandas, numpy, scikit-learn, XGBoost, TensorFlow, PyTorch, OpenCV, rosbags, etc.). It may take several minutes.
-
-> **GPU (optional):** If you have an NVIDIA GPU and want to accelerate TensorFlow/PyTorch training, install the appropriate CUDA toolkit and cuDNN separately. The `requirements.txt` installs CPU-only builds by default.
-
-### 5. Set up the data folder
-
-The scripts expect raw data to live in a specific folder on your machine. Open each script you plan to run and update the hard-coded base path near the top of the file.
-
-Look for a line like:
-```python
-BASE_DIR = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\"
+train_validation_test_data/
+├── train_data_v<VERSION>.csv
+├── validation_data_v<VERSION>.csv
+└── test_data_v<VERSION>.csv
 ```
 
-Change it to the path where your data lives, for example:
-```python
-BASE_DIR = r"C:\Users\yourname\data\Thesis- Biorobotics Lab\"
+### Step 5 — Train a Model
+
+All training scripts read from `train_validation_test_data/` and save to `models parameters/`.
+
+**Recommended — LightGBM:**
+
+```bash
+python Barometers_Based_Tactile_Sensor/LightGBM_sliding_window_predictions.py
 ```
 
-Then create the expected folder structure under that base path (see the **Data Organization** section below). Copy your raw test data files into the corresponding folders.
+Configure at the top of the script: `WINDOW_SIZE`, `USE_SECOND_DERIVATIVE`, `SENSOR_VERSION`.
 
-### 6. (Optional) Flash the Arduino
+**Output:**
+```
+models parameters/averaged models/
+├── lightgbm_sliding_window_model_v<VERSION>.pkl
+└── scaler_sliding_window_v<VERSION>.pkl
+```
 
-If you are collecting new data:
-- Open `Arduino Codes & Barometers Logging & AprilTags Scripts/TactileSensorArduinoCode/TactileSensorCode.ino` in the Arduino IDE
-- Select board: **Arduino MKR Zero**
-- Upload to the board
+### Step 6 — Real-Time Inference
 
-The Arduino will output barometer readings over USB serial at 115200 baud.
+**Simplest option (no ROS):**
 
-### 7. (Optional) Set up VS Code
+```bash
+python realtime_demo.py
+# Or specify port explicitly:
+python realtime_demo.py --port COM3
+```
 
-For the best development experience:
-1. Open the repo folder in VS Code
-2. Press `Ctrl+Shift+P` → **Python: Select Interpreter**
-3. Choose the interpreter at `TactileSensingMasterThesis\Scripts\python.exe` (inside the repo folder)
+Update `_DEFAULT_DATA_ROOT` and `SENSOR_VERSION` in [config.py](config.py) before running.
+
+**Expected output:**
+
+```
+========== Real-Time Tactile Sensor Demo ==========
+Sample        X(mm)      Y(mm)     Fx(N)      Fy(N)      Fz(N)    Contact
+   1234      -5.23       2.14      0.120      0.050      0.340       YES
+```
 
 ---
 
-## Environment Setup
+## Pipeline 2 — Vision-Based Force Estimation
 
-Python virtual environment created for this project:
+### Step 1 — Extract Frames from ROS Bag
 
-```
-C:\venvs\TactileSensingMasterThesis
-```
-
-Activate (PowerShell):
-```powershell
-C:\venvs\TactileSensingMasterThesis\Scripts\Activate.ps1
+```bash
+python Vision_vs_Tactile/direct_jpeg_extractor.py
 ```
 
-If PowerShell blocks activation:
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+An interactive HSV color picker opens — tune the segmentation mask for the deformed region. The script then extracts JPEG frames and a synchronized CSV.
+
+### Step 2 — Estimate Forces from Deformation
+
+```bash
+python Vision_vs_Tactile/Codes_for_cluster/code/forces_for_free.py
 ```
 
-Run a script directly without activating:
-```
-C:\venvs\TactileSensingMasterThesis\Scripts\python.exe path\to\script.py
+*(For HPC clusters: use the `.sh` scripts in `Vision_vs_Tactile/Codes_for_cluster/`)*
+
+---
+
+## Configuration & Hard-Coded Paths
+
+**All scripts contain absolute paths that must be updated for a new machine.**
+
+### Preferred approach — edit `config.py`
+
+Open [config.py](config.py) and change `_DEFAULT_DATA_ROOT`:
+
+```python
+_DEFAULT_DATA_ROOT = Path(r"C:\Users\yourname\data\Thesis- Biorobotics Lab")
 ```
 
-Recreate from scratch:
-```
-python -m venv TactileSensingMasterThesis
-TactileSensingMasterThesis\Scripts\python.exe -m pip install -r requirements.txt
+Or set an environment variable so you never touch the file:
+
+```bash
+# Windows
+set TACTILE_DATA_DIR=C:\Users\yourname\data\Thesis- Biorobotics Lab
+
+# Linux / macOS
+export TACTILE_DATA_DIR=/home/yourname/data/Thesis-Biorobotics-Lab
 ```
 
-Key dependencies: `pandas`, `numpy`, `scipy`, `scikit-learn`, `xgboost`, `lightgbm`, `tensorflow`, `torch`, `opencv-python`, `rosbags`, `pyserial`, `matplotlib`, `seaborn`, `tqdm`, `numba`, `joblib`
+### Key variables in config.py
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `BASE_DATA_DIR` | Root of all data | OneDrive path |
+| `SENSOR_VERSION` | Model/data version tag | `"5.200"` |
+| `WINDOW_SIZE` | Sliding-window length | `10` |
+| `DRIFT_REMOVAL_METHOD` | `"ema"` / `"temperature"` / `"both"` / `"none"` | `"ema"` |
+| `EMA_ALPHA` | EMA smoothing factor | `0.0001` |
+
+> Individual scripts may still override these locally while migration is in progress. Script-level values take precedence until you update each script to `from config import ...`.
 
 ---
 
 ## Data Organization
 
-Most scripts hard-code this base folder:
-
 ```
-C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\
-```
-
-Expected structure under that base:
-
-```
-test data\
-  test <test_num> - sensor v<version_num>\
-    apriltag_detections_trial<test_num>.txt  # AprilTag pose detections log
-    ati_middle_trial<test_num>.txt          # ATI force/torque log
-    barometers_trial<test_num>.txt          # Arduino barometer log
-    processing_test_<test_num>.csv          # Output of step 1
-    synchronized_events_<test_num>.csv      # Output of step 2
-    lin<test_num>\                          # Tip-path plots
-    plots synchronized\                     # Diagnostic plots
-
-train_validation_test_data\
-  train_data_v<version>.csv
-  validation_data_v<version>.csv
-  test_data_v<version>.csv
-  sensor_v<version>\
-
-models parameters\
-  averaged models\     # LightGBM sliding-window models + scalers
-  cnn_models\
-  random forest\
-  regression\
-  NN\
-  XGBoost\
-
-COMSOL_plots\
-hysterisis\
-hysteresys material testing\
-Sensor-Logs\
-ATI_calibration_files\
+BASE_DATA_DIR/
+├── test data/
+│   ├── test 52000 - sensor v5/
+│   │   ├── apriltag_detections_trial52000.txt
+│   │   ├── ati_middle_trial52000.txt
+│   │   ├── barometers_trial52000.txt
+│   │   ├── processing_test_52000.csv         <- Step 2 output
+│   │   └── synchronized_events_52000.csv      <- Step 3 output
+│   └── test 52001 - sensor v5/  ...
+│
+├── train_validation_test_data/
+│   ├── train_data_v5.20.csv
+│   ├── validation_data_v5.20.csv
+│   └── test_data_v5.20.csv
+│
+└── models parameters/
+    └── averaged models/
+        ├── lightgbm_sliding_window_model_v5.200.pkl
+        └── scaler_sliding_window_v5.200.pkl
 ```
 
-> **Note:** Update the hard-coded base path at the top of each script if running on a different machine.
+### File formats
+
+| File | Key Columns |
+|------|-------------|
+| `barometers_trial<N>.txt` | `Epoch_s, b1_P, b1_T, b2_P, b2_T, ..., b6_P, b6_T` |
+| `ati_middle_trial<N>.txt` | `timestamp, Fx, Fy, Fz, Tx, Ty, Tz` |
+| `synchronized_events_<N>.csv` | `t, b1..b6, x, y, z, fx, fy, fz` |
+| `train_data_v<V>.csv` | `t, b1..b6, x, y, fx, fy, fz` |
 
 ---
 
-## Part 1 — Barometer Pipeline (Typical Order)
+## Hardware Setup
 
-### Step 1: Extract Tip Pose and Forces
+### Flash Arduino Firmware
 
-**Script:** `AprilTags_check_weight_location_from_wrench_and_tracking copy.py`
+1. Open **Arduino IDE 2.x**
+2. Board: **Arduino MKR Zero** (Tools > Board > MKR Zero)
+3. Open `Arduino Codes & Barometers Logging & AprilTags Scripts/TactileSensorArduinoCode/TactileSensorCode.ino`
+4. Click **Upload** (Ctrl+U)
 
-- Inputs: `apriltag_detections_trial<num>.txt`, `ati_middle_trial<num>.txt`
-- Outputs: `processing_test_<num>.csv`, tip-path plots in `lin<num>\`
-- What it does: detects tip pose from AprilTag markers, transforms pose to top frame, aligns ATI wrenches, and exports tip-path plots.
+**Serial output at 115200 baud:**
+```
+Time(ms), B1_P, B1_T, B2_P, B2_T, B3_P, B3_T, B4_P, B4_T, B5_P, B5_T, B6_P, B6_T
+0, 101325.2, 22.5, ...
+```
 
-### Step 2: Synchronize Barometers with Forces
+**I2C wiring:** SDA -> Pin 11, SCL -> Pin 12, 3.3 V, GND
 
-**Script:** `data_organization - New.py`
+### Sensor Specs
 
-- Inputs: `processing_test_<num>.csv`, `barometers_trial<num>.txt`
-- Outputs: `synchronized_events_<num>.csv`, diagnostic plots in `plots synchronized\`
-- What it does: removes 2 s warmup, applies drift removal (EMA or linear temperature compensation), dynamically re-zeros barometers when Fz = 0, synchronizes via `merge_asof` (50 ms tolerance), applies spatial masking and MAD-based outlier removal.
-
-### Step 3: Build Train/Validation/Test Splits
-
-**Script:** `train_validation_test_dataset_generation.py`
-
-- Inputs: list of `synchronized_events_<num>.csv` files
-- Outputs: `train_data_v<version>.csv`, `validation_data_v<version>.csv`, `test_data_v<version>.csv`
-
-### Step 4: Train ML Models
-
-All model scripts read from `train_validation_test_data\` and save to `models parameters\`.
-
-| Script | Model | Notes |
-|---|---|---|
-| `Linear_Regression_force_predictions.py` | Linear Regression | Baseline |
-| `random_forest_force_prediction.py` | Random Forest | Per-target models |
-| `XGBoost_force_prediction.py` | XGBoost | Per-target models |
-| `NN_force_prediction.py` | MLP (Keras) | GPU-optimized |
-| `LSTM.py` | LSTM (Keras) | Temporal patterns |
-| `1D_CNN_prediction.py` | 1D CNN (Keras) | Sliding-window input |
-| `RF_or_XGB_sliding_window_predictions.py` | RF / XGBoost / LightGBM | Sliding window + derivatives |
-
-### Step 5: Real-Time Deployment
-
-**Script:** `realtime_tactile_prediction.py`
-**Demo:** `realtime_demo.py`
-
-- Connects to the Arduino over serial (USB)
-- Loads a saved LightGBM model + scaler
-- Predicts Fx, Fy, Fz in a loop at 200–500+ Hz (Numba JIT-compiled)
-- Demo usage (no ROS needed): `python realtime_demo.py --port COM3`
+| Sensor | Part | Range | Rate |
+|--------|------|-------|------|
+| Barometer | DPS310 | 300-1200 hPa | 125 Hz |
+| F/T (ground truth) | ATI Nano17 | +/-70 N, +/-2 N*m | 1 kHz |
 
 ---
 
-## Part 2 — Vision-Based Force Estimation
+## Model Comparison
 
-### Step 1: Extract Frames and Sync Barometers
+| Model | Script | Approx. R² (Fz) | Inference Hz | Notes |
+|-------|--------|----------------|-------------|-------|
+| Linear Regression | `Linear_Regression_force_predictions.py` | ~0.85 | 1000+ | Baseline |
+| Random Forest | `random_forest_force_prediction.py` | ~0.94 | ~50 | Per-target |
+| XGBoost | `random_forest_force_prediction.py` | ~0.95 | ~100 | Per-target |
+| **LightGBM** | `LightGBM_sliding_window_predictions.py` | **~0.97** | **200-500** | **Recommended** |
+| MLP | `NN_force_prediction.py` | ~0.96 | ~200 | GPU-friendly |
+| LSTM | `LSTM.py` | ~0.97 | ~150 | Best temporal |
+| 1D CNN | `1D_CNN_prediction.py` | ~0.97 | ~150 | Compact |
+| Transformer | `transformer_sliding_window_predictions.py` | ~0.97 | ~100 | Experimental |
 
-**Script:** `Vision_vs_Tactile/direct_jpeg_extractor.py`
-
-- Inputs: ROS bag file containing camera images and barometer topics
-- Outputs: extracted JPEG frames with timestamps, synchronized barometer readings
-- Features an interactive HSV color picker (Tab 1: include colors, Tab 2: exclude false positives) for tuning the deformation segmentation
-
-### Step 2: Estimate Forces from Deformation
-
-**Script:** `Vision_vs_Tactile/forces_for_free.py`
-
-- Inputs: extracted frames + synchronized barometer/force data
-- Process: color-based segmentation of the deformed sensor surface → geometric features (blob area, centroid shift) → force estimate
-- Output: time series of vision-estimated forces, compared against ATI ground truth
-
-### Utility
-
-**Script:** `Vision_vs_Tactile/hsv_color_picker.py`
-
-- Interactive tool for selecting HSV color ranges on a sample image
-- Used to calibrate the color segmentation step
+*Numbers are approximate; actual results depend on dataset version and hyperparameters.*
 
 ---
 
-## Modeling Approach and Time-Series Features
+## Troubleshooting
 
-Barometer signals are time-dependent: the array captures pressure dynamics, hysteresis, and transient effects not visible in a single sample. Models are trained on time-series features.
+**`ModuleNotFoundError: No module named 'lightgbm'`**
+```bash
+pip install lightgbm==4.3.0
+```
 
-**Why sliding windows:**
-- Contact events evolve over tens of milliseconds; a short window captures loading/unloading and sensor settling
-- Local context reduces noise sensitivity compared to single-frame input
-- Models can implicitly infer velocity/acceleration trends from history
+**`ModuleNotFoundError: No module named 'tensorflow'`**
+```bash
+pip install tensorflow==2.14.1
+# CPU-only alternative:
+pip install tensorflow-cpu==2.14.1
+```
 
-**Sliding window concept:**
-- For each prediction time `t`, a window of past samples (e.g., 10–31 samples) is stacked as features
-- Window size configured per script (`WINDOW_SIZE`, `WINDOW_RADIUS`)
-- Inputs remain aligned to the prediction target at time `t` (no future data leakage)
+**`RuntimeError: No serial ports found`**
+```bash
+python -m serial.tools.list_ports        # list available ports
+python realtime_demo.py --port COM3      # Windows
+python realtime_demo.py --port /dev/ttyACM0  # Linux
+```
 
-**First and second derivatives:**
-- `d1`: rate of change in pressure — correlates with dynamic force changes
-- `d2`: curvature — captures transient behavior (rapid loading/unloading)
-- Computed after optional denoising (rolling mean), then appended as additional features
-- Controlled by flags in each script (`USE_DERIVATIVES`, `USE_SECOND_DERIVATIVE`)
+**`FileNotFoundError: synchronized_events_<N>.csv`**
+- Check that `TEST_NUMS` in the script matches your actual test folder names
+- Verify `BASE_DATA_DIR` in `config.py` points to the correct location
+
+**`KeyError: 'x_position_mm'` when loading CSVs**
+- Column names vary between test batches. Check your CSV header and update the column-name mapping in `Pose_Forces_Synchronized_with_Baro_Processing.py`.
+
+**Empty output CSV after synchronization**
+- Increase `ASOF_TOLERANCE_S` (e.g. `0.1`) for wider time matching
+- Verify both input files cover an overlapping time range
+- Check that time columns are in seconds, not milliseconds
+
+**`CUDA out of memory` during deep learning training**
+```python
+# Add at top of script before any TF/Torch imports:
+import os; os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+```
+
+**Model predictions are all zeros or NaN**
+- Verify the scaler was saved and loaded from the same training run
+- Check for `-999` sentinel values in training data (`signal_utils.convert_sentinel_to_nan`)
+- Ensure `SENSOR_VERSION` matches between training and inference
 
 ---
 
-## Arduino Firmware
+## Utilities Reference
 
-**File:** `Arduino Codes & Barometers Logging & AprilTags Scripts/TactileSensorArduinoCode/TactileSensorCode.ino`
+### `Barometers_Based_Tactile_Sensor/utils/`
 
-- Hardware: Arduino MKR Zero + 6× DPS310 barometric pressure sensors
-- Reads pressure (Pa) and temperature (°C) from all 6 sensors
-- Serial output at 115200 baud in CSV format:
-  ```
-  Time(ms), B1_P, B1_T, B2_P, B2_T, ..., B6_P, B6_T
-  ```
-- ROS logging wrapper: `baro_serial_node.py` (publishes on `/baro6_raw`)
+| Module | Key Functions |
+|--------|---------------|
+| `barometer_processing.py` | `load_barometer_data()`, `process_barometers()`, `rezero_barometers_when_fz_zero()` |
+| `sensor_io.py` | `load_ati_data()`, `load_atracsys_data()`, `asof_join()` |
+| `signal_utils.py` | `maybe_denoise()`, `convert_sentinel_to_nan()` |
+| `metrics_utils.py` | `calculate_grouped_rmse()`, `evaluate_constrained_region()` |
+| `plot_utils.py` | `plot_pred_vs_actual()`, `plot_error_distributions()` |
+| `io_utils.py` | `load_tabular_csv()` |
 
----
+### Sliding-Window Features
 
-## Utility Modules (`Barometers_Based_Tactile_Sensor/utils/`)
+For each time step `t`, the feature vector stacks the past `W` samples:
 
-| Module | Description |
-|---|---|
-| `barometer_processing.py` | Load barometer data, drift removal, re-zeroing, outlier detection, plotting |
-| `sensor_io.py` | Load AprilTag pose and ATI logs; `asof_join()` for time-series alignment |
-| `signal_utils.py` | Denoising (rolling mean, Savitzky-Golay), first/second derivatives |
-| `metrics_utils.py` | RMSE per target, accuracy in constrained spatial regions |
-| `plot_utils.py` | Scatter plots, error distributions, Keras training history plots |
-| `io_utils.py` | File path helpers, data loading/saving |
+```
+[b1..b6 at t-W..t]  +  [delta_b1..delta_b6 at t-W..t]  +  (optional) [delta2_b1..delta2_b6 at t-W..t]
+```
+
+No future data is used. Window size and derivative order are set in `config.py`.
 
 ---
 
 ## Notes
 
-- All scripts contain hard-coded absolute paths and version numbers — update them at the top of each file before running.
-- The XGBoost script has a typo in its output path (`models paramters` instead of `models parameters`); this is noted in the data structure section above.
-- The `TactileSensingMasterThesis/` folder at the repo root is a local Python venv — it is not part of the source code.
+- Always match `SENSOR_VERSION` across training, evaluation, and inference scripts.
+- Train/val/test CSVs must not overlap in time (no data leakage).
+- The venv folder (`TactileSensingMasterThesis/`) is git-ignored; recreate with `pip install -r requirements.txt`.
+- Clear Jupyter notebook outputs before committing:
+  ```bash
+  jupyter nbconvert --to notebook --ClearOutputPreprocessor.enabled=True sensor_characterization_plots.ipynb
+  ```
+
+---
+
+**Author:** Aurora Ruggeri — Biorobotics Lab, EPFL
+**Last Updated:** March 2026
