@@ -39,14 +39,14 @@ from hsv_color_picker import pick_hsv_bounds, patch_processor
 
 # =========================== CONFIGURATION ===========================
 
-test_num = 52021006
+test_num = 52021011
 # Geometric offsets in object-tag frame O (tag id=1)
 TIP_OFFSET_FROM_ATI_M      = 15/1000   # +15 mm along Z_A (external direction)
 
 # Top surface of tactile sensor in gripper tag frame G (tag id=0)
 # [x, y, z] in metres:  x = +20 mm,  y = -50 mm,  z = -14 mm
 P_G_SURFACE_RIGHT = np.array([+20/1000, -100/1000, -14/1000], dtype=float)
-P_G_SURFACE_LEFT  = np.array([-20/1000, -50/1000, -14/1000], dtype=float)
+P_G_SURFACE_LEFT  = np.array([+100/1000, -100/1000, -14/1000], dtype=float)
 
 # Top surface frame orientation in gripper tag frame G:
 #   X_S = -Y_G,  Y_S = -Z_G,  Z_S = +X_G  (RIGHT)
@@ -561,9 +561,8 @@ class FinRayProcessor:
 
     def _save_force_surface_debug_frame(self, image, detections, wrench_R, wrench_L):
         """
-        Save one debug image showing the right surface frame axes and force arrows
-        (for both L and R) drawn on the top surface of the sensor.
-        Left surface frame axes are NOT drawn (only used for the arrow origin).
+        Save one debug image showing surface frame axes and force arrows
+        for both L and R sides drawn on the top surface of the sensor.
         """
         if self._force_debug_saved:
             return
@@ -581,10 +580,14 @@ class FinRayProcessor:
         R_C_G = det_g['R_C_tag']
         p_G_C = det_g['tvec']
 
-        # Draw surface frame axes for RIGHT side only
+        # Draw surface frame axes for both sides
         R_C_S_right = R_C_G @ self.R_G_S
         p_surf_R_C  = p_G_C + R_C_G @ P_G_SURFACE_RIGHT
         self._draw_frame_axes(debug, R_C_S_right, p_surf_R_C, axis_len_m=0.007, label="S R")
+
+        R_C_S_left = R_C_G @ self.R_G_S_left
+        p_surf_L_C  = p_G_C + R_C_G @ P_G_SURFACE_LEFT
+        self._draw_frame_axes(debug, R_C_S_left, p_surf_L_C, axis_len_m=0.007, label="S L")
 
         # Force arrows for both sides
         for side, R_G_S_side, P_surf, F_S in [
@@ -1083,12 +1086,25 @@ class FinRayProcessor:
             detections = self.detect_apriltags(image)
             self._save_apriltag_debug_frame(image, detections)
 
+            # Skip frames where either AprilTag is missing — forces cannot be
+            # transformed to surface frame so images and metadata are useless.
+            if APRILTAG_GRIPPER_ID not in detections or APRILTAG_OBJECT_ID not in detections:
+                continue
+
             # Save background-zeroed (segmented) image for forces_for_free.py
             seg_img = image.copy()
             seg_img[combined_mask == 0] = 0
             seg_filename = f"seg_{int(row.image_idx):06d}.jpg"
             seg_path = self.seg_dir / seg_filename
             cv2.imwrite(str(seg_path), seg_img)
+
+            # Save left and right halves (split at image centre column)
+            _w = seg_img.shape[1]
+            _mid = _w // 2
+            seg_path_L = self.seg_dir / f"seg_L_{int(row.image_idx):06d}.jpg"
+            seg_path_R = self.seg_dir / f"seg_R_{int(row.image_idx):06d}.jpg"
+            cv2.imwrite(str(seg_path_L), seg_img[:, :_mid])
+            cv2.imwrite(str(seg_path_R), seg_img[:, _mid:])
 
             rel_angle_deg = np.nan
             rel_yaw_deg = np.nan
@@ -1120,6 +1136,8 @@ class FinRayProcessor:
 
             meta = {'image_idx': int(row.image_idx), 'time': float(row.time),
                     'seg_path': str(seg_path),
+                    'seg_path_L': str(seg_path_L),
+                    'seg_path_R': str(seg_path_R),
                     'tag0_detected': APRILTAG_GRIPPER_ID in detections,
                     'tag1_detected': APRILTAG_OBJECT_ID in detections,
                     'gripper_to_object_angle_deg': rel_angle_deg,
@@ -1136,17 +1154,17 @@ class FinRayProcessor:
                 meta['tag1_ty_cam_m'] = float(det_o['tvec'][1])
                 meta['tag1_tz_cam_m'] = float(det_o['tvec'][2])
 
+            _wrench_by_side = {'R': wrench_R, 'L': wrench_L}
             for side in ['R', 'L']:
-                fx = getattr(row, f'force_x_{side}',  0.0)
-                fy = getattr(row, f'force_y_{side}',  0.0)
-                fz = getattr(row, f'force_z_{side}',  0.0)
-                meta[f'fx_{side}']   = float(fx)
-                meta[f'fy_{side}']   = float(fy)
-                meta[f'fz_{side}']   = float(fz)
-                meta[f'tx_{side}']   = float(getattr(row, f'torque_x_{side}', 0.0))
-                meta[f'ty_{side}']   = float(getattr(row, f'torque_y_{side}', 0.0))
-                meta[f'tz_{side}']   = float(getattr(row, f'torque_z_{side}', 0.0))
-                meta[f'fmag_{side}'] = float(np.sqrt(fx**2 + fy**2 + fz**2))
+                F_S = _wrench_by_side[side]['force_surf']
+                M_S = _wrench_by_side[side]['torque_surf']
+                meta[f'fx_{side}']   = float(F_S[0])
+                meta[f'fy_{side}']   = float(F_S[1])
+                meta[f'fz_{side}']   = float(F_S[2])
+                meta[f'tx_{side}']   = float(M_S[0])
+                meta[f'ty_{side}']   = float(M_S[1])
+                meta[f'tz_{side}']   = float(M_S[2])
+                meta[f'fmag_{side}'] = float(np.linalg.norm(F_S))
 
             for side, wrench in [('R', wrench_R), ('L', wrench_L)]:
                 F_A   = wrench['force_applied_ati']
@@ -1193,6 +1211,52 @@ class FinRayProcessor:
         df.to_csv(self.output_dir / "metadata.csv", index=False)
         with open(self.output_dir / "metadata.json", 'w') as f:
             json.dump(metadata_rows, f, indent=2)
+
+        # Enrich barometers_synchronized.csv with surface-frame forces.
+        # The CSV was saved before AprilTag processing, so we merge the
+        # per-frame surface forces back onto the baro timestamps here.
+        # ---- Unified dataset.csv ------------------------------------------------
+        # One row per image frame: timestamp, L/R half-images, surface forces,
+        # and baro pressures (nearest-matched from synchronized_df).
+        _surf_cols  = [f'f{ax}_{side}_surf' for side in ['R', 'L'] for ax in ['x', 'y', 'z']]
+        _baro_cols  = [f'b{i}_{side}' for side in ['R', 'L'] for i in range(1, 7)]
+        _avail_surf = [c for c in _surf_cols if c in df.columns]
+        _unified    = df[['time', 'seg_path_L', 'seg_path_R'] + _avail_surf].copy()
+        _avail_baro = [c for c in _baro_cols if c in self.synchronized_df.columns]
+        if _avail_baro:
+            _baro_src = (
+                self.synchronized_df[['time'] + _avail_baro]
+                .sort_values('time')
+            )
+            _unified = pd.merge_asof(
+                _unified.sort_values('time'),
+                _baro_src,
+                on='time', direction='nearest', tolerance=ASOF_TOLERANCE_S,
+            )
+        _unified.to_csv(self.output_dir / "dataset.csv", index=False)
+        print(f"  Saved unified dataset: {self.output_dir / 'dataset.csv'} "
+              f"({len(_unified)} rows, {len(_unified.columns)} columns)")
+
+        baro_path = self.output_dir / "barometers_synchronized.csv"
+        if baro_path.exists() and len(df) > 0:
+            baro_df = pd.read_csv(baro_path).sort_values('time')
+            for side in ['R', 'L']:
+                side_cols = [f'f{ax}_{side}' for ax in ['x', 'y', 'z']]
+                if not all(c in df.columns for c in side_cols):
+                    continue
+                surf_df = (
+                    df[['time'] + side_cols]
+                    .dropna(subset=side_cols)
+                    .sort_values('time')
+                    .rename(columns={c: f'{c}_surf' for c in side_cols})
+                )
+                baro_df = pd.merge_asof(
+                    baro_df,
+                    surf_df,
+                    on='time', direction='nearest', tolerance=ASOF_TOLERANCE_S,
+                )
+            baro_df.to_csv(baro_path, index=False)
+            print(f"  Added surface-frame forces to {baro_path.name}")
 
         print(f"\n  Processed {len(metadata_rows)} images")
         print(f"  Created ~{len(metadata_rows)//10} visualizations")
@@ -1307,6 +1371,34 @@ def main():
     if processor.baro_right is not None:
         print(f"Right baro samples: {len(processor.baro_right)}")
     print(f"Output directory:   {processor.output_dir}")
+
+    # ---- Sampling rates ----
+    print("\nSampling rates:")
+    def _fs(times):
+        """Compute sampling rate from a 1-D array of timestamps (seconds)."""
+        t = np.asarray(times, dtype=float)
+        if len(t) < 2:
+            return float('nan')
+        return 1.0 / np.mean(np.diff(np.sort(t)))
+
+    img_times = [img['timestamp_sec'] for img in processor.images]
+    if len(img_times) > 1:
+        print(f"  Camera images:          {_fs(img_times):.1f} Hz  ({len(img_times)} frames)")
+
+    if processor.ati_data_right is not None and len(processor.ati_data_right) > 1:
+        print(f"  ATI right:              {_fs(processor.ati_data_right['time']):.1f} Hz  ({len(processor.ati_data_right)} samples)")
+    if processor.ati_data_left is not None and len(processor.ati_data_left) > 1:
+        print(f"  ATI left:               {_fs(processor.ati_data_left['time']):.1f} Hz  ({len(processor.ati_data_left)} samples)")
+
+    if processor.baro_left is not None and len(processor.baro_left) > 1:
+        print(f"  Barometers left:        {_fs(processor.baro_left['time']):.1f} Hz  ({len(processor.baro_left)} samples)")
+    if processor.baro_right is not None and len(processor.baro_right) > 1:
+        print(f"  Barometers right:       {_fs(processor.baro_right['time']):.1f} Hz  ({len(processor.baro_right)} samples)")
+
+    if processor.synchronized_df is not None and len(processor.synchronized_df) > 1:
+        print(f"  Synchronized dataset:   {_fs(processor.synchronized_df['time']):.1f} Hz  ({len(processor.synchronized_df)} rows)")
+        print(f"  Output dataset.csv:     {_fs(processor.synchronized_df['time']):.1f} Hz  (same cadence as camera)")
+
     print("\nGenerated files:")
     print(f"  ~{len(processor.synchronized_df)//10} visualizations  (visualizations/)")
     print(f"  metadata.csv / metadata.json")

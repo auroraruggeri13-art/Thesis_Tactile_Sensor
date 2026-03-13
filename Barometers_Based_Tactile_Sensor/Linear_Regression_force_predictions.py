@@ -171,6 +171,7 @@ if __name__ == "__main__":
         y_test, predictions, OUTPUT_TARGETS,
         title_suffix=model_name,
         scatter_color='#292f56',
+        axis_limits={'x': (-60, 60), 'y': (-14, 14)},
     )
     fig.savefig(plot_save_path, bbox_inches='tight', dpi=300)
     plt.show()

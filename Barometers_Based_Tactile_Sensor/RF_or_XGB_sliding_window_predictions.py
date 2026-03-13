@@ -40,7 +40,7 @@ from sklearn.ensemble import RandomForestRegressor
 # ============================================================
 
 DATA_DIRECTORY = r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\train_validation_test_data"
-sensor_version = 5.002
+sensor_version = 5.02
 TRAIN_FILENAME = f"train_data_v{sensor_version}.csv"
 VALIDATION_FILENAME = f"validation_data_v{sensor_version}.csv"
 TEST_FILENAME  = f"test_data_v{sensor_version}.csv"
@@ -1320,6 +1320,31 @@ def main():
         plt.show()
         fig.savefig(os.path.join(save_dir_comparison, f'actual_vs_prediction_{model_name.lower()}_{version}.png'), bbox_inches='tight', dpi=300)
         print(f"{model_name} prediction plot saved.")
+
+        # Per-target RMSE on test set
+        sep = "=" * 40
+        print("")
+        print(sep)
+        print(model_name + " - Test Set RMSE")
+        print(sep)
+        for j, col in enumerate(TARGET_COLS):
+            rmse = np.sqrt(np.mean((y_test[:, j] - y_hat[:, j]) ** 2))
+            unit = "mm" if col in ["x", "y"] else "N"
+            print("  " + col.ljust(6) + " RMSE: " + f"{rmse:.4f}" + " " + unit)
+        print(sep)
+        # Euclidean RMSE summary
+        pos_idx = [i for i, c in enumerate(TARGET_COLS) if c in ["x", "y"]]
+        frc_idx = [i for i, c in enumerate(TARGET_COLS) if c in ["fx", "fy", "fz"]]
+        if pos_idx:
+            pos_rmse = [np.sqrt(np.mean((y_test[:, i] - y_hat[:, i]) ** 2)) for i in pos_idx]
+            euc_pos = np.sqrt(sum(r**2 for r in pos_rmse))
+            print("  Position Euclidean RMSE : " + f"{euc_pos:.4f}" + " mm  (sqrt(RMSE_x2 + RMSE_y2))")
+        if frc_idx:
+            frc_rmse = [np.sqrt(np.mean((y_test[:, i] - y_hat[:, i]) ** 2)) for i in frc_idx]
+            euc_frc = np.sqrt(sum(r**2 for r in frc_rmse))
+            print("  Force    Euclidean RMSE : " + f"{euc_frc:.4f}" + " N   (sqrt(RMSE_fx2 + RMSE_fy2 + RMSE_fz2))")
+        print(sep)
+        print("")
 
         # 4) Error distribution plots
         fig_err = plot_error_distributions(y_test, y_hat, TARGET_COLS, title_suffix=model_name)

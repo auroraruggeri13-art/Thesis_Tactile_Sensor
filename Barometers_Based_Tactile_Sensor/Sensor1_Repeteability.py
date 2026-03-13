@@ -13,13 +13,13 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from utils.signal_utils import maybe_denoise, convert_sentinel_to_nan
 
 # ===================== CONFIG =====================
-TRAIN_SENSOR = 5.17
-TEST_SENSOR  = 5.1895
+TRAIN_SENSOR = 5.200
+TEST_SENSOR  = 5.17
 
 BASE_DIR = Path(r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab")
 MODEL_PATH  = BASE_DIR / "models parameters" / "averaged models" / f"lightgbm_sliding_window_model_v{TRAIN_SENSOR:.3f}.pkl"
 SCALER_PATH = BASE_DIR / "models parameters" / "averaged models" / f"scaler_sliding_window_v{TRAIN_SENSOR:.3f}.pkl"
-TEST_PATH   = BASE_DIR / "train_validation_test_data" / f"train_data_v{TEST_SENSOR}.csv"
+TEST_PATH   = BASE_DIR / "train_validation_test_data" / f"test_data_v{TEST_SENSOR:.2f}.csv"
 
 TIME_COL   = "t"
 BARO_COLS  = ["b1","b2","b3","b4","b5","b6"]
@@ -28,7 +28,7 @@ TARGET_COLS = ["x","y", "fx", "fy", "fz"] # []
 WINDOW_SIZE = 10          # MUST match training
 APPLY_DENOISING = True    # MUST match training
 DENOISE_WINDOW  = 5       # MUST match training
-USE_SECOND_DERIVATIVE = False  # MUST match training
+USE_SECOND_DERIVATIVE = True  # MUST match training
 MAX_TIME_GAP = 0.05       # same default as your function
 
 # Sentinel value conversion (MUST match data_organization and training)

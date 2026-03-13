@@ -27,10 +27,11 @@ def plot_pred_vs_actual(
     scatter_color=None,
     ideal_line_color="r",
     show_units=False,
-    figsize_factor=(4, 4),
-    title_fontsize=10,
-    xlabel_fontsize=8,
-    ylabel_fontsize=8,
+    figsize_factor=(5, 5),
+    title_fontsize=16,
+    xlabel_fontsize=14,
+    ylabel_fontsize=14,
+    axis_limits=None,
 ):
     """
     Scatter plot of predicted vs. actual values for every target column.
@@ -84,6 +85,8 @@ def plot_pred_vs_actual(
             min_val - (max_val - min_val) * 0.05,
             max_val + (max_val - min_val) * 0.05,
         ]
+        if axis_limits and col in axis_limits:
+            lims = list(axis_limits[col])
         ax.plot(lims, lims, linestyle="--", color=ideal_line_color, alpha=0.75, linewidth=1.5)
 
         mae = mean_absolute_error(true_vals, pred_vals)
@@ -98,12 +101,13 @@ def plot_pred_vs_actual(
 
         ax.set_xlabel("Actual", fontsize=xlabel_fontsize)
         ax.set_ylabel("Predicted", fontsize=ylabel_fontsize)
+        ax.tick_params(axis='both', labelsize=12)
         ax.grid(True, alpha=0.3)
         ax.set_xlim(lims)
         ax.set_ylim(lims)
 
     if title_suffix:
-        plt.suptitle(f"Predicted vs Actual ({title_suffix})", fontsize=12)
+        plt.suptitle(f"Predicted vs Actual ({title_suffix})", fontsize=18, fontweight='bold')
     plt.tight_layout()
 
     if save_path is not None:
