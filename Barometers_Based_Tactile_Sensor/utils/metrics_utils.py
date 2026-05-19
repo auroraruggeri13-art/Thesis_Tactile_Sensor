@@ -9,7 +9,7 @@ evaluate_constrained_region -- Evaluate metrics inside a rectangular x-y region.
 """
 
 import numpy as np
-from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.metrics import mean_absolute_error, r2_score, root_mean_squared_error
 
 
 def calculate_grouped_rmse(y_true, y_pred, target_names, title_suffix="", return_metrics=False):
@@ -38,55 +38,61 @@ def calculate_grouped_rmse(y_true, y_pred, target_names, title_suffix="", return
     print("\n" + "=" * 70 + f"\nGROUPED RMSE METRICS {title_suffix}\n" + "=" * 70)
     metrics = {}
 
-    # ---- Contact location (x, y) ----
-    contact_indices = [i for i, name in enumerate(target_names) if name in ["x", "y"]]
-    if len(contact_indices) >= 2:
-        t_true = y_true[:, contact_indices]
-        t_pred = y_pred[:, contact_indices]
-        err = t_true - t_pred
-        rmse_comp = np.sqrt(np.mean(err ** 2))
-        dist = np.sqrt(np.sum(err ** 2, axis=1))
-        rmse_euc = np.sqrt(np.mean(dist ** 2))
-        print(f"\nContact Location (x, y):")
-        print(f"  - Component-wise RMSE: {rmse_comp:.4f} mm")
-        print(f"  - Euclidean RMSE:      {rmse_euc:.4f} mm")
-        print(f"  - Mean error distance: {np.mean(dist):.4f} mm")
-        metrics["contact_location_rmse"] = rmse_comp
-        metrics["contact_euclidean_rmse"] = rmse_euc
+    groups = [
+        {
+            "keys":        ["x", "y"],
+            "label":       "Contact Location (x, y)",
+            "unit":        "mm",
+            "scale":       1.0,
+            "min_count":   2,
+            "rmse_key":    "contact_location_rmse",
+            "euc_key":     "contact_euclidean_rmse",
+        },
+        {
+            "keys":        ["fx", "fy", "fz"],
+            "label":       "{n}-DOF Force Vector ({names})",
+            "unit":        "N",
+            "scale":       1.0,
+            "min_count":   1,
+            "rmse_key":    "force_vector_rmse",
+            "euc_key":     "force_euclidean_rmse",
+        },
+        {
+            "keys":        ["tx", "ty", "tz"],
+            "label":       "{n}-DOF Torque Vector ({names})",
+            "unit":        "N\u00b7mm",
+            "scale":       1000.0,
+            "min_count":   1,
+            "rmse_key":    "torque_vector_rmse",
+            "euc_key":     "torque_euclidean_rmse",
+        },
+    ]
 
-    # ---- Force vector (fx, fy, fz) ----
-    force_indices = [i for i, name in enumerate(target_names) if name in ["fx", "fy", "fz"]]
-    if force_indices:
-        t_true = y_true[:, force_indices]
-        t_pred = y_pred[:, force_indices]
-        err = t_true - t_pred
-        rmse_comp = np.sqrt(np.mean(err ** 2))
-        mag = np.sqrt(np.sum(err ** 2, axis=1))
-        rmse_euc = np.sqrt(np.mean(mag ** 2))
-        force_names = [target_names[i] for i in force_indices]
-        print(f"\n{len(force_indices)}-DOF Force Vector ({', '.join(force_names)}):")
-        print(f"  - Component-wise RMSE: {rmse_comp:.4f} N")
-        print(f"  - Euclidean RMSE:      {rmse_euc:.4f} N")
-        print(f"  - Mean error magnitude: {np.mean(mag):.4f} N")
-        metrics["force_vector_rmse"] = rmse_comp
-        metrics["force_euclidean_rmse"] = rmse_euc
+    for g in groups:
+        indices = [i for i, name in enumerate(target_names) if name in g["keys"]]
+        if len(indices) < g["min_count"]:
+            continue
 
-    # ---- Torque vector (tx, ty, tz) ----
-    torque_indices = [i for i, name in enumerate(target_names) if name in ["tx", "ty", "tz"]]
-    if torque_indices:
-        t_true = y_true[:, torque_indices]
-        t_pred = y_pred[:, torque_indices]
-        err = t_true - t_pred
-        rmse_comp = np.sqrt(np.mean(err ** 2))
-        mag = np.sqrt(np.sum(err ** 2, axis=1))
-        rmse_euc = np.sqrt(np.mean(mag ** 2))
-        torque_names = [target_names[i] for i in torque_indices]
-        print(f"\n{len(torque_indices)}-DOF Torque Vector ({', '.join(torque_names)}):")
-        print(f"  - Component-wise RMSE: {rmse_comp * 1000:.4f} N\u00b7mm")
-        print(f"  - Euclidean RMSE:      {rmse_euc * 1000:.4f} N\u00b7mm")
-        print(f"  - Mean error magnitude: {np.mean(mag) * 1000:.4f} N\u00b7mm")
-        metrics["torque_vector_rmse"] = rmse_comp
-        metrics["torque_euclidean_rmse"] = rmse_euc
+        t_true = y_true[:, indices]
+        t_pred = y_pred[:, indices]
+        names = [target_names[i] for i in indices]
+        scale = g["scale"]
+        unit = g["unit"]
+
+        rmse_per_comp = root_mean_squared_error(t_true, t_pred, multioutput='raw_values')
+        rmse_comp_avg = np.mean(rmse_per_comp)
+        rmse_euc = np.sqrt(np.sum(rmse_per_comp ** 2))
+        mag = np.sqrt(np.sum((t_true - t_pred) ** 2, axis=1))
+
+        label = g["label"].format(n=len(indices), names=", ".join(names))
+        print(f"\n{label}:")
+        for name, rmse_c in zip(names, rmse_per_comp):
+            print(f"  - RMSE {name}: {rmse_c * scale:.4f} {unit}")
+        print(f"  - Avg component-wise RMSE: {rmse_comp_avg * scale:.4f} {unit}")
+        print(f"  - Euclidean RMSE:          {rmse_euc * scale:.4f} {unit}")
+        print(f"  - Mean error magnitude:    {np.mean(mag) * scale:.4f} {unit}")
+        metrics[g["rmse_key"]] = rmse_comp_avg
+        metrics[g["euc_key"]] = rmse_euc
 
     if return_metrics:
         return metrics

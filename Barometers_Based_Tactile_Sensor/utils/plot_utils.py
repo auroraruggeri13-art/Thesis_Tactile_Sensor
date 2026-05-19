@@ -25,11 +25,13 @@ def plot_pred_vs_actual(
     alpha=0.5,
     s=20,
     scatter_color=None,
+    ideal_line_color="r",
     show_units=False,
-    figsize_factor=(4, 4),
-    title_fontsize=10,
-    xlabel_fontsize=8,
-    ylabel_fontsize=8,
+    figsize_factor=(5, 5),
+    title_fontsize=16,
+    xlabel_fontsize=14,
+    ylabel_fontsize=14,
+    axis_limits=None,
 ):
     """
     Scatter plot of predicted vs. actual values for every target column.
@@ -46,6 +48,8 @@ def plot_pred_vs_actual(
         Scatter transparency and marker size.
     scatter_color : color spec or None
         Explicit scatter colour; None uses the matplotlib default cycle.
+    ideal_line_color : color spec
+        Colour for the dashed ideal y=x reference line.
     show_units : bool
         If True, append "mm" (for x, y) or "N" (for forces) to subplot titles.
     figsize_factor : (w, h)
@@ -81,31 +85,29 @@ def plot_pred_vs_actual(
             min_val - (max_val - min_val) * 0.05,
             max_val + (max_val - min_val) * 0.05,
         ]
-        ax.plot(lims, lims, "r--", alpha=0.75, linewidth=1.5)
+        if axis_limits and col in axis_limits:
+            lims = list(axis_limits[col])
+        ax.plot(lims, lims, linestyle="--", color=ideal_line_color, alpha=0.75, linewidth=1.5)
 
         mae = mean_absolute_error(true_vals, pred_vals)
         r2 = r2_score(true_vals, pred_vals)
 
-        if show_units:
-            unit = "mm" if col in ["x", "y"] else "N"
-            ax.set_title(
-                f"{col}\nMAE: {mae:.2f} {unit} | R\u00b2: {r2:.3f}",
-                fontsize=title_fontsize,
-            )
-        else:
-            ax.set_title(
-                f"{col}\nMAE: {mae:.2f} | R\u00b2: {r2:.3f}",
-                fontsize=title_fontsize,
-            )
+        unit = "mm" if col in ["x", "y"] else "N"
+        display_col = col.capitalize() if col not in ["x", "y"] else col
+        ax.set_title(
+            f"{display_col} ({unit})\nMAE: {mae:.2f} {unit} | R\u00b2: {r2:.3f}",
+            fontsize=title_fontsize,
+        )
 
         ax.set_xlabel("Actual", fontsize=xlabel_fontsize)
         ax.set_ylabel("Predicted", fontsize=ylabel_fontsize)
+        ax.tick_params(axis='both', labelsize=12)
         ax.grid(True, alpha=0.3)
         ax.set_xlim(lims)
         ax.set_ylim(lims)
 
     if title_suffix:
-        plt.suptitle(f"Predicted vs Actual ({title_suffix})", fontsize=12)
+        plt.suptitle(f"Predicted vs Actual ({title_suffix})", fontsize=18, fontweight='bold')
     plt.tight_layout()
 
     if save_path is not None:

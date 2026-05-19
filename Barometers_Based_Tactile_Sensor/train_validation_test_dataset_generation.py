@@ -9,17 +9,59 @@ import numpy as np
 # ================== CONFIG ==================
 # Base directory that contains all test folders
 DATA_DIRECTORY = Path(r"C:\Users\aurir\OneDrive - epfl.ch\Thesis- Biorobotics Lab\test data")
-VERSION_NUM = 5.1092
+VERSION_NUM = 5.20
 
 # Fractions must sum to 1.0
-TRAIN_FRAC = 1
-VAL_FRAC   = 0.0
-TEST_FRAC  = 0.0
+TRAIN_FRAC = 0.70
+VAL_FRAC   = 0.15
+TEST_FRAC  = 0.15
 
 # Relative CSV paths inside DATA_DIRECTORY
 CSV_FILENAMES = [
     
-    r"test 51092 - sensor v5\synchronized_events_51092.csv",
+    # r"test 51791 - sensor v5\synchronized_events_51791.csv",
+    # r"test 51792 - sensor v5\synchronized_events_51792.csv",
+    # r"test 51793 - sensor v5\synchronized_events_51793.csv",
+    
+    # r"test 52092 - sensor v5\synchronized_events_52092.csv",
+    
+    # r"test 51795 - sensor v5\synchronized_events_51795.csv",
+    
+    r"test 52000 - sensor v5\synchronized_events_52000.csv",
+    r"test 52001 - sensor v5\synchronized_events_52001.csv",
+    r"test 52002 - sensor v5\synchronized_events_52002.csv",
+    r"test 52003 - sensor v5\synchronized_events_52003.csv",
+    r"test 52004 - sensor v5\synchronized_events_52004.csv",   
+    r"test 52005 - sensor v5\synchronized_events_52005.csv",
+    r"test 52006 - sensor v5\synchronized_events_52006.csv",
+    
+    # r"test 52100 - sensor v5\synchronized_events_52100.csv",
+    # # r"test 52101 - sensor v5\synchronized_events_52101.csv",
+    # # r"test 52102 - sensor v5\synchronized_events_52102.csv",
+    
+    # ## r"test 52200 - sensor v5\synchronized_events_52200.csv", # molto male
+    
+    # r"test 51700 - sensor v5\synchronized_events_51700.csv",
+    # r"test 51701 - sensor v5\synchronized_events_51701.csv",
+    # r"test 51702 - sensor v5\synchronized_events_51702.csv",
+    # r"test 51704 - sensor v5\synchronized_events_51704.csv",
+    # r"test 51705 - sensor v5\synchronized_events_51705.csv",
+    # # r"test 51706 - sensor v5\synchronized_events_51706.csv",
+    # # r"test 51707 - sensor v5\synchronized_events_51707.csv",
+    # # r"test 51708 - sensor v5\synchronized_events_51708.csv",    
+    # # r"test 51709 - sensor v5\synchronized_events_51709.csv",
+    # # r"test 51710 - sensor v5\synchronized_events_51710.csv",
+    
+    # r"test 51800 - sensor v5\synchronized_events_51800.csv",
+    # r"test 51801 - sensor v5\synchronized_events_51801.csv",
+    # r"test 51802 - sensor v5\synchronized_events_51802.csv",
+    # r"test 51803 - sensor v5\synchronized_events_51803.csv",
+    # # r"test 51804 - sensor v5\synchronized_events_51804.csv",
+
+    # r"test 51900 - sensor v5\synchronized_events_51900.csv",
+    # r"test 51901 - sensor v5\synchronized_events_51901.csv",
+    # r"test 51902 - sensor v5\synchronized_events_51902.csv",
+    # r"test 51903 - sensor v5\synchronized_events_51903.csv",
     
     # r"test 2 - sensor v5\synchronized_events_2.csv",
     # r"test 3 - sensor v5\synchronized_events_3.csv",    
@@ -194,6 +236,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 train_parts = []
 val_parts   = []
 test_parts  = []
+sampling_rates = []  # collect per-file sampling rates
 
 for rel_path in CSV_FILENAMES:
     input_path = DATA_DIRECTORY / rel_path
@@ -208,6 +251,17 @@ for rel_path in CSV_FILENAMES:
     if n == 0:
         print(f"[WARN] Input CSV is empty, nothing to split: {input_path}")
         continue
+
+    # Calculate input file sampling rate
+    time_col = next((c for c in ['t', 'time', 'ros_time', 'Epoch_s'] if c in df.columns), None)
+    if time_col and n > 1:
+        diffs = np.diff(df[time_col].values.astype(float))
+        fs = 1.0 / np.mean(diffs)
+        print(f"  [{rel_path}] Sampling rate: {fs:.1f} Hz  (n={n} rows)")
+        sampling_rates.append(fs)
+    else:
+        print(f"  [{rel_path}] No time column found, cannot compute sampling rate  (n={n} rows)")
+        sampling_rates.append(float('nan'))
 
     # Compute split indices (no shuffle, keep order)
     n_train = int(n * TRAIN_FRAC)
@@ -245,6 +299,15 @@ print("\n========== SUMMARY ==========")
 print(f"Final train rows: {len(combined_train)} -> {train_path}")
 print(f"Final val   rows: {len(combined_val)} -> {val_path}")
 print(f"Final test  rows: {len(combined_test)} -> {test_path}")
+
+# Report sampling rates
+valid_rates = [r for r in sampling_rates if not np.isnan(r)]
+if valid_rates:
+    avg_fs  = np.mean(valid_rates)
+    min_fs  = np.min(valid_rates)
+    max_fs  = np.max(valid_rates)
+    print(f"\nInput files  — avg sampling rate: {avg_fs:.1f} Hz  (min {min_fs:.1f}, max {max_fs:.1f})")
+    print(f"Output CSVs  — sampling rate: ~{avg_fs:.1f} Hz  (rows concatenated, same rate as inputs)")
 
 # ========== FUNCTION TO PLOT DATA DISTRIBUTION ==========
 def plot_data_distribution(y_data, target_names, title_prefix=""):

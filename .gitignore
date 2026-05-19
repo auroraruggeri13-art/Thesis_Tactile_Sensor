@@ -1,13 +1,80 @@
-# Non tenere file di modelli enormi
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# ============================================================
+# Virtual Environment
+# ============================================================
+TactileSensingMasterThesis/
+
+# ============================================================
+# ML Model Files (large binaries — store externally)
+# ============================================================
 *.pkl
+*.pickle
+*.joblib
+*.h5
+*.hdf5
+*.pth
+*.pt
+*.ckpt
+*.pb
+*.onnx
+saved_model/
 
-# Cache Python
-__pycache__/
-*.pyc
+# ============================================================
+# Data Files (store externally or in a data/ folder ignored here)
+# ============================================================
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.parquet
+*.feather
+*.npy
+*.npz
+*.bag
 
-TactileSensingMasterThesis/Lib/
-TactileSensingMasterThesis/Scripts/
-TactileSensingMasterThesis/pyvenv.cfg
-__pycache__/
-*.pyc
+# ============================================================
+# Jupyter Notebooks — ignore checkpoint dirs & large outputs
+# ============================================================
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
 
+# ============================================================
+# IDE & Editor
+# ============================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*.suo
+*.user
+.history/
+
+# ============================================================
+# OS-Generated Files
+# ============================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============================================================
+# Logs & Temp Files
+# ============================================================
+*.log
+*.tmp
+*.bak
+*.orig
+
+# ============================================================
+# Secrets (never commit these)
+# ============================================================
+.env
+.env.*
+credentials*.json
+secrets*.json
